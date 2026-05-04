@@ -71,7 +71,7 @@ class MoveAction(BaseModel):
 class Snake(BaseModel):
     id: str
     name: str
-    health: int
+    health: Optional[int] = None
     body: List[Optional[Point]]
     head: Optional[Point] = None
     length: Optional[int] = None
