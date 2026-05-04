@@ -7,13 +7,15 @@ from typing import Dict, List, Optional, Set, Tuple
 from battlesnake_types import Food, GameState, MoveAction, Direction, BaseAgent, Point
 
 # ── Tunable constants ────────────────────────────────────────────────────────
-HUNT_HEALTH_THRESHOLD    = 40    # Hunt only when health > this
-HUNT_MAX_DISTANCE        = 10    # Max A* steps to chase a hunt target
-COIL_HEALTH_THRESHOLD    = 40    # Coil only when health > this
-COIL_TERRITORY_THRESHOLD = 0.50  # Coil when we control ≥ this share of territory
-URGENCY_FULL             = 70    # ≥ this health → full food-path penalties
-URGENCY_NONE             = 20    # ≤ this health → zero penalties (desperation)
-TERRITORY_PRESSURE_LOW   = 0.30  # Below this ratio → extra food urgency applied
+HUNT_HEALTH_THRESHOLD     = 40    # Hunt only when health > this
+HUNT_MAX_DISTANCE         = 10    # Max A* steps to chase a hunt target
+SQUEEZE_HEALTH_THRESHOLD  = 40    # Squeeze only when health > this
+SQUEEZE_TERRITORY_THRESHOLD = 0.45  # Squeeze when we own > 45% in a 1v1
+COIL_HEALTH_THRESHOLD     = 40    # Coil only when health > this
+COIL_TERRITORY_THRESHOLD  = 0.50  # Coil when we control ≥ this share of territory
+URGENCY_FULL              = 70    # ≥ this health → full food-path penalties
+URGENCY_NONE              = 20    # ≤ this health → zero penalties (desperation)
+TERRITORY_PRESSURE_LOW    = 0.30  # Below this ratio → extra food urgency applied
 
 
 # ---------------------------------------------------------
@@ -266,6 +268,78 @@ def find_hunt_move(
 
 
 # ---------------------------------------------------------
+# Squeeze (late-game boundary compression)
+# ---------------------------------------------------------
+def find_squeeze_move(
+    game_state: GameState,
+    obstacle_map: np.ndarray,
+    head: Point,
+    safe_moves: List[Direction],
+    area_scores: Dict[Direction, int],
+    risk_cells: Set[Tuple[int, int]],
+    territory_cells: Dict[str, Set[Tuple[int, int]]],
+    snake_length: int,
+    health: int,
+    territory_ratio: float,
+) -> Optional[Direction]:
+    """
+    Late-game squeeze — active boundary compression against the last opponent.
+
+    Strategy:
+      The Voronoi map already tells us exactly which cells each snake owns.
+      We collect every cell owned by the opponent, find the one closest to
+      our head (Manhattan distance), and A* toward it.
+
+      Routing into the opponent's nearest territory cell does two things:
+        1. We physically move toward their space, shrinking the gap.
+        2. Next turn, that cell will be even closer to us in the Voronoi BFS,
+           so it flips to ours — the boundary advances by one cell per turn.
+
+      Repeated over many turns this creates a "wall" that walks across the
+      board toward the opponent, leaving them with an ever-smaller pocket
+      until they can no longer survive.
+
+    Only called when:
+      • Exactly one opponent is visible (1v1 end-game)
+      • We own > SQUEEZE_TERRITORY_THRESHOLD of territory
+      • Health is above the starvation threshold
+    """
+    my_id = game_state.you.id
+
+    # Union of all cells owned by opponents (could be multiple if contested
+    # cells already excluded from territory_cells)
+    opp_cells: Set[Tuple[int, int]] = set()
+    for sid, cells in territory_cells.items():
+        if sid != my_id:
+            opp_cells |= cells
+
+    if not opp_cells:
+        return None  # Opponent owns nothing visible — squeeze complete
+
+    # Find the opponent cell with minimum Manhattan distance to our head.
+    # This is the nearest point on the boundary we should push toward.
+    target_rc = min(
+        opp_cells,
+        key=lambda pos: abs(pos[0] - head.y) + abs(pos[1] - head.x),
+    )
+    target = Point(x=target_rc[1], y=target_rc[0])
+
+    direction, length = a_star_wrapper(obstacle_map, head, target)
+    if direction is None or direction not in safe_moves:
+        return None
+
+    area    = area_scores[direction]
+    risky   = (head.x + direction.dx, head.y + direction.dy) in risk_cells
+    penalty = compute_food_penalties(health, area, snake_length, risky, territory_ratio)
+
+    # Reject squeeze paths that are suicidally costly (deep dead-end + danger)
+    if penalty > 4.0:
+        return None
+
+    return direction
+
+
+# ---------------------------------------------------------
 # Coil (territory-denial) — Voronoi-aware
 # ---------------------------------------------------------
 def find_coil_move(
@@ -419,7 +493,43 @@ class DominatorAgent(BaseAgent):
             if hunt_dir is not None:
                 return MoveAction(move=hunt_dir)
 
-        # ── 8. COIL: Voronoi-driven territory patrol ──────────────────────────
+        # ── 8. SQUEEZE: late-game boundary compression ───────────────────────
+        #
+        # When exactly one opponent remains visible and we own the majority of
+        # territory, we stop coiling passively and instead advance our Voronoi
+        # boundary directly toward their space.
+        #
+        # Each turn we A* toward the nearest cell they currently own.  Moving
+        # there shifts the BFS distances in our favour next turn, so the
+        # boundary advances by ~1 cell per move.  Over time this creates a
+        # contracting wall that leaves the opponent with an ever-shrinking
+        # pocket — they eventually run out of room and die.
+        #
+        # Squeeze sits between Hunt and Coil:
+        #   • Hunt still fires first — a direct head-on kill is always better.
+        #   • Squeeze beats Coil in 1v1 — passive patrolling is sub-optimal
+        #     when we can actively compress the opponent's remaining space.
+        visible_opponents = [
+            s for s in game_state.board.snakes
+            if s.id != game_state.you.id and s.head is not None
+        ]
+        should_squeeze = (
+            len(visible_opponents) == 1
+            and health > SQUEEZE_HEALTH_THRESHOLD
+            and territory_ratio > SQUEEZE_TERRITORY_THRESHOLD
+        )
+        if should_squeeze:
+            squeeze_dir = find_squeeze_move(
+                game_state=game_state, obstacle_map=obstacle_map, head=head,
+                safe_moves=safe_moves, area_scores=area_scores,
+                risk_cells=risk_cells, territory_cells=territory_cells,
+                snake_length=snake_length, health=health,
+                territory_ratio=territory_ratio,
+            )
+            if squeeze_dir is not None:
+                return MoveAction(move=squeeze_dir)
+
+        # ── 9. COIL: Voronoi-driven territory patrol ──────────────────────────
         #
         # Replaces the old length-only is_dominant() check.  We coil when:
         #   • We own ≥ COIL_TERRITORY_THRESHOLD (50%) of non-contested cells
@@ -430,14 +540,10 @@ class DominatorAgent(BaseAgent):
         # reachable from the landing position — so The Dominator actively
         # patrols its own controlled space rather than wandering into the
         # contested middle.
-        opponents_visible = any(
-            s.id != game_state.you.id and s.head is not None
-            for s in game_state.board.snakes
-        )
         should_coil = (
             health > COIL_HEALTH_THRESHOLD
             and territory_ratio >= COIL_TERRITORY_THRESHOLD
-            and opponents_visible
+            and len(visible_opponents) > 0
         )
         if should_coil:
             coil_dir = find_coil_move(
