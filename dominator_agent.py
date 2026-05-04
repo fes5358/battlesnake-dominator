@@ -306,8 +306,7 @@ def find_squeeze_move(
     """
     my_id = game_state.you.id
 
-    # Union of all cells owned by opponents (could be multiple if contested
-    # cells already excluded from territory_cells)
+    # Union of all cells owned by opponents
     opp_cells: Set[Tuple[int, int]] = set()
     for sid, cells in territory_cells.items():
         if sid != my_id:
@@ -316,17 +315,57 @@ def find_squeeze_move(
     if not opp_cells:
         return None  # Opponent owns nothing visible — squeeze complete
 
-    # Find the opponent cell with minimum Manhattan distance to our head.
-    # This is the nearest point on the boundary we should push toward.
-    target_rc = min(
-        opp_cells,
-        key=lambda pos: abs(pos[0] - head.y) + abs(pos[1] - head.x),
-    )
+    # ── Contested cell priority scoring ────────────────────────────────────
+    #
+    # Naive approach: route to the *nearest* opponent cell.
+    # Better approach: route to the cell that yields the most territory per
+    # unit of travel — i.e. the cell surrounded by the most other opponent
+    # cells, weighted by how close it is to us.
+    #
+    # For each opponent cell we compute:
+    #
+    #   adjacency_gain  — number of its 4 orthogonal neighbours that are also
+    #                     opponent-owned.  When we reach this cell and the
+    #                     Voronoi boundary advances, those neighbours are the
+    #                     next to flip to ours on subsequent turns.  A deep
+    #                     interior cell scores higher than an isolated edge
+    #                     cell, so the squeeze pushes into dense opponent
+    #                     territory rather than nibbling at a thin border.
+    #
+    #   manhattan_dist  — steps from our head.  Shorter paths are preferred
+    #                     because every turn we're not there is a turn the
+    #                     opponent could use to eat or escape.
+    #
+    #   priority_score  — adjacency_gain / max(1, manhattan_dist)
+    #                     Higher is better: many cells freed, short journey.
+    #
+    # We score every opponent cell and pick the highest, then A* toward it.
+    #
+    def priority_score(pos: Tuple[int, int]) -> float:
+        r, c = pos
+        adj_opp = sum(
+            1 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]
+            if (r + dr, c + dc) in opp_cells
+        )
+        dist = abs(r - head.y) + abs(c - head.x)
+        return (adj_opp + 1) / max(1, dist)  # +1 so isolated cells still compete
+
+    target_rc = max(opp_cells, key=priority_score)
     target = Point(x=target_rc[1], y=target_rc[0])
 
-    direction, length = a_star_wrapper(obstacle_map, head, target)
+    direction, _ = a_star_wrapper(obstacle_map, head, target)
     if direction is None or direction not in safe_moves:
-        return None
+        # Best-score target unreachable — fall back to nearest reachable cell
+        candidates = sorted(
+            opp_cells,
+            key=lambda pos: abs(pos[0] - head.y) + abs(pos[1] - head.x),
+        )
+        for fallback_rc in candidates:
+            direction, _ = a_star_wrapper(obstacle_map, head, Point(x=fallback_rc[1], y=fallback_rc[0]))
+            if direction is not None and direction in safe_moves:
+                break
+        else:
+            return None
 
     area    = area_scores[direction]
     risky   = (head.x + direction.dx, head.y + direction.dy) in risk_cells
