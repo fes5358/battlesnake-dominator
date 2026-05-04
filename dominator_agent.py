@@ -1,3 +1,4 @@
+from collections import deque
 from dataclasses import dataclass, field
 import heapq
 import numpy as np
@@ -6,35 +7,50 @@ from typing import Dict, List, Optional, Set, Tuple
 from battlesnake_types import Food, GameState, MoveAction, Direction, BaseAgent, Point
 
 # ── Tunable constants ────────────────────────────────────────────────────────
-HUNT_HEALTH_THRESHOLD = 40   # Hunt only when health > this
-HUNT_MAX_DISTANCE     = 10   # Max A* steps to bother chasing a target
-COIL_HEALTH_THRESHOLD = 40   # Coil only when health > this
-URGENCY_FULL          = 70   # ≥ this health → full food-path penalties
-URGENCY_NONE          = 20   # ≤ this health → zero food-path penalties (desperation)
+HUNT_HEALTH_THRESHOLD    = 40    # Hunt only when health > this
+HUNT_MAX_DISTANCE        = 10    # Max A* steps to chase a hunt target
+COIL_HEALTH_THRESHOLD    = 40    # Coil only when health > this
+COIL_TERRITORY_THRESHOLD = 0.50  # Coil when we control ≥ this share of territory
+URGENCY_FULL             = 70    # ≥ this health → full food-path penalties
+URGENCY_NONE             = 20    # ≤ this health → zero penalties (desperation)
+TERRITORY_PRESSURE_LOW   = 0.30  # Below this ratio → extra food urgency applied
 
 
 # ---------------------------------------------------------
 # Health-aware food penalty helpers
 # ---------------------------------------------------------
-def food_penalty_scale(health: int) -> float:
+def food_penalty_scale(health: int, territory_ratio: float) -> float:
     """
-    Linear scale [0.0, 1.0] governing how much area/risk penalties apply to
-    food paths.  Full penalties at high health; none at desperation level.
+    Returns a scale factor in [0.0, 1.0] governing how much area/risk
+    penalties apply to food paths.
 
-      health ≥ 70 → 1.00  (area_pen 2.0, risk_pen 3.0)
-      health = 45 → 0.50  (area_pen 1.5, risk_pen 2.0)
-      health ≤ 20 → 0.00  (area_pen 1.0, risk_pen 1.0 — take any food)
+    Two independent drivers reduce the scale (increase urgency):
+      • Health dropping below URGENCY_FULL toward URGENCY_NONE
+      • Territory ratio below TERRITORY_PRESSURE_LOW (we're losing space → grow)
+
+    The two urgencies combine additively and are clamped to [0, 1].
+
+    Examples (health-only, no territory pressure):
+      health 70 → scale 1.00  area_pen 2.0  risk_pen 3.0
+      health 45 → scale 0.50  area_pen 1.5  risk_pen 2.0
+      health 20 → scale 0.00  area_pen 1.0  risk_pen 1.0  (desperation)
     """
-    if health >= URGENCY_FULL:
-        return 1.0
-    if health <= URGENCY_NONE:
-        return 0.0
-    return (health - URGENCY_NONE) / (URGENCY_FULL - URGENCY_NONE)
+    health_scale = max(0.0, min(1.0, (health - URGENCY_NONE) / (URGENCY_FULL - URGENCY_NONE)))
+
+    # Extra urgency when we're losing the territory war
+    if territory_ratio < TERRITORY_PRESSURE_LOW:
+        territory_urgency = (TERRITORY_PRESSURE_LOW - territory_ratio) / TERRITORY_PRESSURE_LOW
+    else:
+        territory_urgency = 0.0
+
+    return max(0.0, health_scale - territory_urgency)
 
 
-def compute_food_penalties(health: int, area: int, snake_length: int, risky: bool) -> float:
-    """Combined area × risk multiplier, scaled by current health urgency."""
-    scale    = food_penalty_scale(health)
+def compute_food_penalties(
+    health: int, area: int, snake_length: int, risky: bool, territory_ratio: float
+) -> float:
+    """Combined area × risk multiplier, scaled by health + territory urgency."""
+    scale    = food_penalty_scale(health, territory_ratio)
     area_pen = 1.0 + 1.0 * scale if area < snake_length else 1.0
     risk_pen = 1.0 + 2.0 * scale if risky else 1.0
     return area_pen * risk_pen
@@ -86,10 +102,7 @@ def get_safe_moves(game_state: GameState, obstacle_map: np.ndarray) -> List[Dire
 
 
 def flood_fill_cells(grid: np.ndarray, start: Tuple[int, int]) -> Set[Tuple[int, int]]:
-    """
-    BFS from start; returns the full set of reachable open (row, col) cells.
-    Used for tail-reachability checks in coil mode.
-    """
+    """BFS from start; returns full set of reachable (row, col) cells."""
     h, w = grid.shape
     r0, c0 = start
     if not (0 <= r0 < h and 0 <= c0 < w) or grid[r0, c0]:
@@ -106,24 +119,14 @@ def flood_fill_cells(grid: np.ndarray, start: Tuple[int, int]) -> Set[Tuple[int,
     return visited
 
 
-def flood_fill_area(grid: np.ndarray, start: Tuple[int, int]) -> int:
-    """Convenience wrapper — returns just the count of reachable cells."""
-    return len(flood_fill_cells(grid, start))
-
-
 def score_moves_by_area(
-    safe_moves: List[Direction],
-    obstacle_map: np.ndarray,
-    head: Point,
+    safe_moves: List[Direction], obstacle_map: np.ndarray, head: Point
 ) -> Dict[Direction, int]:
-    return {d: flood_fill_area(obstacle_map, (head.y + d.dy, head.x + d.dx)) for d in safe_moves}
+    return {d: len(flood_fill_cells(obstacle_map, (head.y + d.dy, head.x + d.dx))) for d in safe_moves}
 
 
 def get_head_collision_risks(game_state: GameState) -> Set[Tuple[int, int]]:
-    """
-    (x, y) cells that an equal-or-larger opponent could step into next turn.
-    Moving there = head-on collision we lose or tie (both fatal).
-    """
+    """(x, y) cells an equal-or-larger opponent could step into next turn."""
     my_id     = game_state.you.id
     my_length = game_state.you.length or len(game_state.you.body)
     risky: Set[Tuple[int, int]] = set()
@@ -140,6 +143,82 @@ def get_head_collision_risks(game_state: GameState) -> Set[Tuple[int, int]]:
 
 
 # ---------------------------------------------------------
+# Voronoi territory map
+# ---------------------------------------------------------
+CONTESTED = "__contested__"   # sentinel for cells equidistant between snakes
+
+def compute_voronoi(
+    game_state: GameState,
+    obstacle_map: np.ndarray,
+) -> Tuple[Dict[str, int], Dict[str, Set[Tuple[int, int]]]]:
+    """
+    Multi-source BFS from every visible snake head simultaneously.
+    Each open cell is assigned to whichever snake reaches it first.
+    Cells equidistant between two snakes are marked as contested (neither owns them).
+
+    Returns:
+      territory_counts  — {snake_id: number_of_cells_owned}
+      territory_cells   — {snake_id: set_of_(row,col)_cells_owned}
+
+    This gives a precise per-turn picture of board control — far more accurate
+    than a simple length comparison, because position and obstacles matter.
+    """
+    h, w = obstacle_map.shape
+    cell_owner: Dict[Tuple[int, int], str] = {}   # (r,c) → snake_id or CONTESTED
+    cell_dist:  Dict[Tuple[int, int], int] = {}
+
+    q: deque[Tuple[int, int]] = deque()
+
+    for snake in game_state.board.snakes:
+        if snake.head is None:
+            continue
+        r, c = snake.head.y, snake.head.x
+        if obstacle_map[r, c]:
+            continue
+        pos = (r, c)
+        if pos not in cell_dist:
+            cell_dist[pos]  = 0
+            cell_owner[pos] = snake.id
+            q.append(pos)
+        else:
+            # Two snake heads on the same cell → contested
+            if cell_owner[pos] != snake.id:
+                cell_owner[pos] = CONTESTED
+
+    while q:
+        r, c = q.popleft()
+        current_dist = cell_dist[(r, c)]
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < h and 0 <= nc < w) or obstacle_map[nr, nc]:
+                continue
+            new_dist = current_dist + 1
+            pos = (nr, nc)
+            if pos not in cell_dist:
+                cell_dist[pos]  = new_dist
+                cell_owner[pos] = cell_owner[(r, c)]
+                q.append(pos)
+            elif cell_dist[pos] == new_dist:
+                # Equidistant from a different snake → contested
+                if cell_owner[pos] != cell_owner[(r, c)]:
+                    cell_owner[pos] = CONTESTED
+
+    # Aggregate into counts and cell sets
+    territory_counts: Dict[str, int] = {}
+    territory_cells:  Dict[str, Set[Tuple[int, int]]] = {}
+
+    for pos, owner in cell_owner.items():
+        if owner == CONTESTED:
+            continue
+        territory_counts[owner] = territory_counts.get(owner, 0) + 1
+        if owner not in territory_cells:
+            territory_cells[owner] = set()
+        territory_cells[owner].add(pos)
+
+    return territory_counts, territory_cells
+
+
+# ---------------------------------------------------------
 # Hunting
 # ---------------------------------------------------------
 def find_hunt_move(
@@ -151,11 +230,9 @@ def find_hunt_move(
     snake_length: int,
     risk_cells: Set[Tuple[int, int]],
     health: int,
+    territory_ratio: float,
 ) -> Optional[Direction]:
-    """
-    Route toward a cell adjacent to a smaller opponent's head.
-    Same health-aware penalty formula as food seeking.
-    """
+    """Route toward a cell adjacent to a smaller opponent's head."""
     my_id = game_state.you.id
     best_direction: Optional[Direction] = None
     best_cost = float('inf')
@@ -179,7 +256,7 @@ def find_hunt_move(
 
             area     = area_scores[direction]
             risky    = (head.x + direction.dx, head.y + direction.dy) in risk_cells
-            eff_cost = length * compute_food_penalties(health, area, snake_length, risky)
+            eff_cost = length * compute_food_penalties(health, area, snake_length, risky, territory_ratio)
 
             if eff_cost < best_cost:
                 best_direction = direction
@@ -189,22 +266,8 @@ def find_hunt_move(
 
 
 # ---------------------------------------------------------
-# Coil (territory-denial)
+# Coil (territory-denial) — Voronoi-aware
 # ---------------------------------------------------------
-def is_dominant(game_state: GameState) -> bool:
-    """
-    True when we are strictly longer than every visible opponent.
-    Requires at least one opponent in view — no point coiling in an empty board.
-    In Blackout rules this is automatically limited to visible snakes.
-    """
-    my_id     = game_state.you.id
-    my_length = game_state.you.length or len(game_state.you.body)
-    opponents = [s for s in game_state.board.snakes if s.id != my_id and s.head is not None]
-    if not opponents:
-        return False
-    return all((s.length or len(s.body)) < my_length for s in opponents)
-
-
 def find_coil_move(
     game_state: GameState,
     obstacle_map: np.ndarray,
@@ -212,45 +275,41 @@ def find_coil_move(
     safe_moves: List[Direction],
     risk_cells: Set[Tuple[int, int]],
     snake_length: int,
+    our_territory_cells: Set[Tuple[int, int]],
 ) -> Optional[Direction]:
     """
-    Territory-denial coil strategy — activated when we are the dominant snake.
+    Territory-denial coil strategy, now Voronoi-aware.
 
-    For each safe landing cell we run a full flood-fill and score the move on
-    three criteria (in priority order):
-
-      1. tail_reachable — can we still reach our own tail from there?
-         Keeping the tail reachable maintains the coil loop and prevents
-         self-entrapment.  If the tail is outside vision (None), we proxy
-         using area ≥ snake_length as a safe-enough heuristic.
-
-      2. not_risky — the landing cell is not in any equal/larger opponent's
-         next-turn reach (avoids accidental head-on while coiling).
-
-      3. area — more open space is always preferred; maximising area denies
-         territory to trapped opponents and keeps the loop wide.
-
-    No A* calls needed — flood_fill_cells gives us both the area count and
-    tail reachability in a single BFS pass per candidate move.
+    Scoring per candidate landing cell (priority order):
+      1. tail_reachable  — can we still reach our own tail from there?
+         Prevents self-entrapment while looping.
+      2. not_risky       — landing cell is not in any equal/larger opponent's
+         next-turn reach.
+      3. our_territory   — how many of our Voronoi-controlled cells are
+         reachable from the landing position?  This makes The Dominator
+         patrol its own territory rather than wandering into contested space.
+      4. total_area      — tiebreaker: more open cells is always better.
     """
     tail = game_state.you.body[-1]
 
     best_direction: Optional[Direction] = None
-    best_score: Tuple[int, int, int] = (-1, -1, -1)
+    best_score: Tuple[int, int, int, int] = (-1, -1, -1, -1)
 
     for d in safe_moves:
         nx, ny = head.x + d.dx, head.y + d.dy
-        reachable = flood_fill_cells(obstacle_map, (ny, nx))
-        area      = len(reachable)
+        reachable  = flood_fill_cells(obstacle_map, (ny, nx))
+        total_area = len(reachable)
+
+        # How many of our Voronoi-controlled cells are reachable from here?
+        our_reachable = len(reachable & our_territory_cells) if our_territory_cells else total_area
 
         if tail is not None:
             tail_reachable = 1 if (tail.y, tail.x) in reachable else 0
         else:
-            # Tail outside vision — use area as proxy
-            tail_reachable = 1 if area >= snake_length else 0
+            tail_reachable = 1 if total_area >= snake_length else 0
 
         not_risky = 0 if (nx, ny) in risk_cells else 1
-        score     = (tail_reachable, not_risky, area)
+        score     = (tail_reachable, not_risky, our_reachable, total_area)
 
         if score > best_score:
             best_score     = score
@@ -296,7 +355,6 @@ class DominatorAgent(BaseAgent):
         obstacle_map = get_obstacle_map(game_state)
 
         # ── 2. Safe moves — absolute hard filter ────────────────────────────
-        #    Walls and reversals kill instantly. Nothing may override this.
         safe_moves = get_safe_moves(game_state, obstacle_map)
         if not safe_moves:
             return MoveAction(move=Direction.UP)
@@ -310,14 +368,29 @@ class DominatorAgent(BaseAgent):
         def is_risky(d: Direction) -> bool:
             return (head.x + d.dx, head.y + d.dy) in risk_cells
 
-        # Rank: non-risky first, then most open — governs all fallbacks
         ranked_safe_moves = sorted(
             safe_moves,
             key=lambda d: (0 if is_risky(d) else 1, area_scores[d]),
             reverse=True,
         )
 
-        # ── 5. Food memory (Blackout vision support) ─────────────────────────
+        # ── 5. Voronoi territory map ──────────────────────────────────────────
+        #
+        # Multi-source BFS from every visible snake head — each open cell is
+        # claimed by whichever head reaches it first.  This gives:
+        #
+        #   territory_ratio   — share of non-contested cells we own  [0, 1]
+        #   our_cells         — the exact set we control this turn
+        #
+        # territory_ratio replaces the old length-only dominance check and also
+        # feeds into the food-urgency penalty scale (low ratio → more urgent).
+        territory_counts, territory_cells = compute_voronoi(game_state, obstacle_map)
+        our_cells      = territory_cells.get(game_state.you.id, set())
+        our_count      = territory_counts.get(game_state.you.id, 0)
+        total_claimed  = sum(territory_counts.values())
+        territory_ratio = our_count / max(1, total_claimed)
+
+        # ── 6. Food memory (Blackout vision support) ─────────────────────────
         view_radius = game_state.game.ruleset.settings.viewRadius
         if view_radius is not None:
             vision_mask = get_vision_mask(
@@ -335,44 +408,51 @@ class DominatorAgent(BaseAgent):
         else:
             agent_state.possible_food = list(game_state.board.food)
 
-        # ── 6. HUNT: intercept a visible smaller opponent ────────────────────
-        #    Only when healthy.  Hunt is checked before coil because an
-        #    adjacent kill opportunity is more time-sensitive than patrolling.
+        # ── 7. HUNT: intercept a visible smaller opponent ────────────────────
         if health > HUNT_HEALTH_THRESHOLD:
             hunt_dir = find_hunt_move(
                 game_state=game_state, obstacle_map=obstacle_map, head=head,
                 safe_moves=safe_moves, area_scores=area_scores,
-                snake_length=snake_length, risk_cells=risk_cells, health=health,
+                snake_length=snake_length, risk_cells=risk_cells,
+                health=health, territory_ratio=territory_ratio,
             )
             if hunt_dir is not None:
                 return MoveAction(move=hunt_dir)
 
-        # ── 7. COIL: territory-denial when dominant ──────────────────────────
+        # ── 8. COIL: Voronoi-driven territory patrol ──────────────────────────
         #
-        # When we are the longest visible snake AND healthy, stop chasing food
-        # and instead patrol the board in a space-filling loop.  This:
-        #   • denies territory to cornered opponents, hastening their death
-        #   • keeps our tail reachable, preventing self-entrapment
-        #   • maximises the open area we control each turn
+        # Replaces the old length-only is_dominant() check.  We coil when:
+        #   • We own ≥ COIL_TERRITORY_THRESHOLD (50%) of non-contested cells
+        #   • At least one opponent is visible (no point coiling alone)
+        #   • Health is above the starvation threshold
         #
-        # The snake resumes food-seeking the moment health drops to or below
-        # COIL_HEALTH_THRESHOLD, so starvation is never a risk.
-        if health > COIL_HEALTH_THRESHOLD and is_dominant(game_state):
+        # Inside find_coil_move the score now maximises our_territory cells
+        # reachable from the landing position — so The Dominator actively
+        # patrols its own controlled space rather than wandering into the
+        # contested middle.
+        opponents_visible = any(
+            s.id != game_state.you.id and s.head is not None
+            for s in game_state.board.snakes
+        )
+        should_coil = (
+            health > COIL_HEALTH_THRESHOLD
+            and territory_ratio >= COIL_TERRITORY_THRESHOLD
+            and opponents_visible
+        )
+        if should_coil:
             coil_dir = find_coil_move(
                 game_state=game_state, obstacle_map=obstacle_map, head=head,
                 safe_moves=safe_moves, risk_cells=risk_cells,
-                snake_length=snake_length,
+                snake_length=snake_length, our_territory_cells=our_cells,
             )
             if coil_dir is not None:
                 return MoveAction(move=coil_dir)
 
-        # ── 8. Seek food — health-aware penalties ────────────────────────────
+        # ── 9. Seek food — health + territory aware penalties ────────────────
         #
-        #   effective_cost = path_length × compute_food_penalties(health, ...)
-        #
-        #   health ≥ 70: area_pen 2.0, risk_pen 3.0  (very selective)
-        #   health = 45: area_pen 1.5, risk_pen 2.0  (moderately urgent)
-        #   health ≤ 20: area_pen 1.0, risk_pen 1.0  (desperate — take anything)
+        # territory_ratio < TERRITORY_PRESSURE_LOW adds extra urgency on top
+        # of the health curve, so a losing snake eats more aggressively to
+        # grow and reclaim space.
         result_direction: Optional[Direction] = None
         best_cost = float('inf')
 
@@ -383,6 +463,7 @@ class DominatorAgent(BaseAgent):
             penalty  = compute_food_penalties(
                 health=health, area=area_scores[direction],
                 snake_length=snake_length, risky=is_risky(direction),
+                territory_ratio=territory_ratio,
             )
             eff_cost = length * penalty
             if eff_cost < best_cost:
@@ -392,7 +473,7 @@ class DominatorAgent(BaseAgent):
         if result_direction is not None:
             return MoveAction(move=result_direction)
 
-        # ── 9. Fallback: follow own tail ─────────────────────────────────────
+        # ── 10. Fallback: follow own tail ─────────────────────────────────────
         tail = game_state.you.body[-1]
         if tail is not None:
             direction, _ = a_star_wrapper(obstacle_map, head, tail)
@@ -403,7 +484,7 @@ class DominatorAgent(BaseAgent):
                     return MoveAction(move=direction)
                 return MoveAction(move=ranked_safe_moves[0])
 
-        # ── 10. Final fallback: safest, most open direction ───────────────────
+        # ── 11. Final fallback: safest, most open direction ───────────────────
         return MoveAction(move=ranked_safe_moves[0])
 
     def end(self, game_state: GameState):
@@ -414,7 +495,7 @@ class DominatorAgent(BaseAgent):
 # ---------------------------------------------------------
 # A* Algorithm
 # ---------------------------------------------------------
-def a_star_wrapper(grid: np.ndarray, start: Point, goal: Point) -> tuple[Optional[Direction], int]:
+def a_star_wrapper(grid: np.ndarray, start: Point, goal: Point) -> Tuple[Optional[Direction], int]:
     if start.x == goal.x and start.y == goal.y:
         return None, 0
     path = a_star(grid, (start.y, start.x), (goal.y, goal.x))
@@ -425,9 +506,7 @@ def a_star_wrapper(grid: np.ndarray, start: Point, goal: Point) -> tuple[Optiona
 
 
 def a_star(
-    grid: np.ndarray,
-    start: Tuple[int, int],
-    goal: Tuple[int, int],
+    grid: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int]
 ) -> Optional[List[Tuple[int, int]]]:
     h, w = grid.shape
     open_set: list[tuple[int, tuple[int, int]]] = [(0, start)]
