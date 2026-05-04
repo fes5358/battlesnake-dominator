@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 import heapq
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from battlesnake_types import Food, GameState, MoveAction, Direction, BaseAgent, Point
 
@@ -32,7 +32,7 @@ def get_safe_moves(game_state: GameState, obstacle_map: np.ndarray) -> List[Dire
       1. Within board boundaries (uses actual board width/height)
       2. Not the neck position (prevents reversing direction)
       3. Not occupied by an obstacle (snake bodies)
-    This must be evaluated before any food/pathfinding logic.
+    This is evaluated before any food/pathfinding logic — absolute priority.
     """
     head = game_state.you.head
     if head is None:
@@ -69,16 +69,15 @@ def get_safe_moves(game_state: GameState, obstacle_map: np.ndarray) -> List[Dire
 
 def flood_fill_area(grid: np.ndarray, start: Tuple[int, int]) -> int:
     """
-    BFS from `start`, counting all reachable open cells (not blocked by grid).
-    Used to score how much space a move opens up vs traps the snake.
-    Returns 0 if start is itself blocked or out of bounds.
+    BFS from `start`, counting all reachable open cells.
+    Returns 0 if start is blocked or out of bounds.
     """
     h, w = grid.shape
     r0, c0 = start
     if not (0 <= r0 < h and 0 <= c0 < w) or grid[r0, c0]:
         return 0
 
-    visited: set[Tuple[int, int]] = {start}
+    visited: Set[Tuple[int, int]] = {start}
     stack = [start]
     while stack:
         r, c = stack.pop()
@@ -96,14 +95,47 @@ def score_moves_by_area(
     head: Point,
 ) -> Dict[Direction, int]:
     """
-    For each safe move, compute the number of open cells reachable
-    from that position via flood fill. Higher = more open space.
+    For each safe move, flood-fill from the landing cell to count open space.
+    Higher score = more room to manoeuvre.
     """
     scores: Dict[Direction, int] = {}
     for d in safe_moves:
         nx, ny = head.x + d.dx, head.y + d.dy
         scores[d] = flood_fill_area(obstacle_map, (ny, nx))
     return scores
+
+
+def get_head_collision_risks(game_state: GameState) -> Set[Tuple[int, int]]:
+    """
+    Returns (x, y) cells that an equal-or-larger opponent snake could move
+    into on the next turn.  Stepping into one of these means our head meets
+    theirs — we always lose ties or lose outright when they're bigger.
+
+    In Blackout rules only visible opponents (within view radius) appear on
+    the board, so this naturally respects the limited-vision constraint.
+    """
+    my_id = game_state.you.id
+    my_length = game_state.you.length or len(game_state.you.body)
+
+    risky: Set[Tuple[int, int]] = set()
+
+    for snake in game_state.board.snakes:
+        if snake.id == my_id or snake.head is None:
+            continue
+
+        opp_length = snake.length or len(snake.body)
+        if opp_length < my_length:
+            # Smaller snake — head-on collision favours us; skip
+            continue
+
+        # Every cell the opponent could legally step into next turn
+        for d in Direction:
+            nx = snake.head.x + d.dx
+            ny = snake.head.y + d.dy
+            if 0 <= nx < game_state.board.width and 0 <= ny < game_state.board.height:
+                risky.add((nx, ny))
+
+    return risky
 
 
 # ---------------------------------------------------------
@@ -150,24 +182,33 @@ class DominatorAgent(BaseAgent):
         obstacle_map = get_obstacle_map(game_state)
 
         # ── Step 2: Compute safe moves — ABSOLUTE TOP PRIORITY ─────────────
-        # Wall hits and direction reversals kill immediately — nothing overrides this.
+        # Walls and direction reversals kill immediately — nothing overrides this.
         safe_moves = get_safe_moves(game_state, obstacle_map)
 
         if not safe_moves:
             return MoveAction(move=Direction.UP)
 
         # ── Step 3: Score safe moves by flood-fill area ─────────────────────
-        # How much open space is reachable if we take each safe step?
-        # This prevents us from walking into dead-end corridors.
         area_scores = score_moves_by_area(safe_moves, obstacle_map, head)
 
-        # Moves ranked best→worst by open area — used for all fallbacks
-        ranked_safe_moves = sorted(safe_moves, key=lambda d: area_scores[d], reverse=True)
+        # ── Step 4: Identify head-collision risk cells ──────────────────────
+        # Any cell an equal-or-larger opponent could move to next turn.
+        risk_cells = get_head_collision_risks(game_state)
 
-        # Snake body length: used to judge whether an area is "too small"
+        def is_risky(d: Direction) -> bool:
+            return (head.x + d.dx, head.y + d.dy) in risk_cells
+
+        # Rank safe moves: non-risky first, then by open area (both descending).
+        # This means the final fallback always picks the safest, most open move.
+        ranked_safe_moves = sorted(
+            safe_moves,
+            key=lambda d: (0 if is_risky(d) else 1, area_scores[d]),
+            reverse=True,
+        )
+
         snake_length = game_state.you.length or len(game_state.you.body)
 
-        # ── Step 4: Update food memory (Blackout vision support) ────────────
+        # ── Step 5: Update food memory (Blackout vision support) ────────────
         view_radius = game_state.game.ruleset.settings.viewRadius
         if view_radius is not None:
             vision_mask = get_vision_mask(
@@ -187,11 +228,19 @@ class DominatorAgent(BaseAgent):
         else:
             agent_state.possible_food = list(game_state.board.food)
 
-        # ── Step 5: A* toward food, weighted by corridor danger ─────────────
-        # Effective cost = path_length * penalty, where penalty is 2× if the
-        # first step leads into an area smaller than our own body. This means
-        # food 5 steps away through open space beats food 3 steps away through
-        # a dead-end corridor (5×1 = 5 < 3×2 = 6).
+        # ── Step 6: A* toward food, penalised for corridors and danger ───────
+        #
+        # effective_cost = path_length × area_penalty × risk_penalty
+        #
+        #   area_penalty = 2.0  if first-step area < snake length (dead-end risk)
+        #   risk_penalty = 3.0  if first step lands in a head-collision danger cell
+        #
+        # Examples (snake length 5):
+        #   Food 3 steps, safe open path          →  3 × 1 × 1  =  3  ✓ best
+        #   Food 3 steps, dead-end corridor        →  3 × 2 × 1  =  6
+        #   Food 3 steps, head-collision danger    →  3 × 1 × 3  =  9
+        #   Food 3 steps, dead-end + danger        →  3 × 2 × 3  = 18  ✗ avoid
+
         result_direction: Optional[Direction] = None
         best_effective_cost = float('inf')
 
@@ -200,28 +249,33 @@ class DominatorAgent(BaseAgent):
             if direction is None or direction not in safe_moves:
                 continue
 
-            area = area_scores[direction]
-            # Penalise moves leading into areas smaller than the snake itself
-            penalty = 2.0 if area < snake_length else 1.0
-            effective_cost = length * penalty
+            area        = area_scores[direction]
+            area_pen    = 2.0 if area < snake_length else 1.0
+            risk_pen    = 3.0 if is_risky(direction) else 1.0
+            eff_cost    = length * area_pen * risk_pen
 
-            if effective_cost < best_effective_cost:
-                result_direction = direction
-                best_effective_cost = effective_cost
+            if eff_cost < best_effective_cost:
+                result_direction    = direction
+                best_effective_cost = eff_cost
 
         if result_direction is not None:
             return MoveAction(move=result_direction)
 
-        # ── Step 6: Fallback — follow own tail (avoids self-enclosure) ───────
+        # ── Step 7: Fallback — follow own tail (avoids self-enclosure) ───────
         tail = game_state.you.body[-1]
         if tail is not None:
             direction, _ = a_star_wrapper(obstacle_map, head, tail)
             if direction is not None and direction in safe_moves:
-                return MoveAction(move=direction)
+                # Still check: prefer non-risky tail-chase direction
+                if not is_risky(direction):
+                    return MoveAction(move=direction)
+                # Risky tail-chase — only use it if no better ranked move exists
+                best_ranked = ranked_safe_moves[0]
+                if is_risky(best_ranked):
+                    return MoveAction(move=direction)
+                return MoveAction(move=best_ranked)
 
-        # ── Step 7: Final fallback — most open safe direction ────────────────
-        # ranked_safe_moves[0] has the largest flood-fill area, minimising the
-        # chance of entering a dead-end corridor.
+        # ── Step 8: Final fallback — safest, most open direction ─────────────
         return MoveAction(move=ranked_safe_moves[0])
 
     def end(self, game_state: GameState):
