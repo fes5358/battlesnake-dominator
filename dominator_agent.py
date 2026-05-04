@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 import heapq
 import numpy as np
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from battlesnake_types import Food, GameState, MoveAction, Direction, BaseAgent, Point
 
@@ -38,7 +38,6 @@ def get_safe_moves(game_state: GameState, obstacle_map: np.ndarray) -> List[Dire
     if head is None:
         return list(Direction)
 
-    # Neck is body[1] — moving there reverses the snake
     neck: Optional[Point] = None
     body = game_state.you.body
     if len(body) > 1 and body[1] is not None:
@@ -66,6 +65,45 @@ def get_safe_moves(game_state: GameState, obstacle_map: np.ndarray) -> List[Dire
         safe.append(d)
 
     return safe
+
+
+def flood_fill_area(grid: np.ndarray, start: Tuple[int, int]) -> int:
+    """
+    BFS from `start`, counting all reachable open cells (not blocked by grid).
+    Used to score how much space a move opens up vs traps the snake.
+    Returns 0 if start is itself blocked or out of bounds.
+    """
+    h, w = grid.shape
+    r0, c0 = start
+    if not (0 <= r0 < h and 0 <= c0 < w) or grid[r0, c0]:
+        return 0
+
+    visited: set[Tuple[int, int]] = {start}
+    stack = [start]
+    while stack:
+        r, c = stack.pop()
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < h and 0 <= nc < w and not grid[nr, nc] and (nr, nc) not in visited:
+                visited.add((nr, nc))
+                stack.append((nr, nc))
+    return len(visited)
+
+
+def score_moves_by_area(
+    safe_moves: List[Direction],
+    obstacle_map: np.ndarray,
+    head: Point,
+) -> Dict[Direction, int]:
+    """
+    For each safe move, compute the number of open cells reachable
+    from that position via flood fill. Higher = more open space.
+    """
+    scores: Dict[Direction, int] = {}
+    for d in safe_moves:
+        nx, ny = head.x + d.dx, head.y + d.dy
+        scores[d] = flood_fill_area(obstacle_map, (ny, nx))
+    return scores
 
 
 # ---------------------------------------------------------
@@ -96,11 +134,9 @@ class DominatorAgent(BaseAgent):
         return "sharp"
 
     def start(self, game_state: GameState):
-        """start is called when the battlesnake begins a game"""
         self.agent_states[game_state.game.id] = AgentState()
 
     def move(self, game_state: GameState) -> MoveAction:
-        """move is called on every turn and returns your next move"""
         head = game_state.you.head
         if head is None:
             return MoveAction(move=Direction.UP)
@@ -114,15 +150,24 @@ class DominatorAgent(BaseAgent):
         obstacle_map = get_obstacle_map(game_state)
 
         # ── Step 2: Compute safe moves — ABSOLUTE TOP PRIORITY ─────────────
-        # No food, pathfinding, or fallback logic may return a move that is
-        # not in this list (wall hit or direction reversal = instant death).
+        # Wall hits and direction reversals kill immediately — nothing overrides this.
         safe_moves = get_safe_moves(game_state, obstacle_map)
 
         if not safe_moves:
-            # Completely trapped — nothing we can do; pick UP as last resort
             return MoveAction(move=Direction.UP)
 
-        # ── Step 3: Update food memory (Blackout vision support) ────────────
+        # ── Step 3: Score safe moves by flood-fill area ─────────────────────
+        # How much open space is reachable if we take each safe step?
+        # This prevents us from walking into dead-end corridors.
+        area_scores = score_moves_by_area(safe_moves, obstacle_map, head)
+
+        # Moves ranked best→worst by open area — used for all fallbacks
+        ranked_safe_moves = sorted(safe_moves, key=lambda d: area_scores[d], reverse=True)
+
+        # Snake body length: used to judge whether an area is "too small"
+        snake_length = game_state.you.length or len(game_state.you.body)
+
+        # ── Step 4: Update food memory (Blackout vision support) ────────────
         view_radius = game_state.game.ruleset.settings.viewRadius
         if view_radius is not None:
             vision_mask = get_vision_mask(
@@ -140,38 +185,46 @@ class DominatorAgent(BaseAgent):
                     updated_food.append(food)
             agent_state.possible_food = updated_food
         else:
-            # Standard rules — food is fully visible every turn
             agent_state.possible_food = list(game_state.board.food)
 
-        # ── Step 4: A* toward nearest food ──────────────────────────────────
+        # ── Step 5: A* toward food, weighted by corridor danger ─────────────
+        # Effective cost = path_length * penalty, where penalty is 2× if the
+        # first step leads into an area smaller than our own body. This means
+        # food 5 steps away through open space beats food 3 steps away through
+        # a dead-end corridor (5×1 = 5 < 3×2 = 6).
         result_direction: Optional[Direction] = None
-        min_distance = float('inf')
+        best_effective_cost = float('inf')
 
         for food in agent_state.possible_food:
             direction, length = a_star_wrapper(obstacle_map, head, food)
-            # Only accept the move if it is safe (wall / neck / obstacle check)
-            if direction is not None and direction in safe_moves and length < min_distance:
+            if direction is None or direction not in safe_moves:
+                continue
+
+            area = area_scores[direction]
+            # Penalise moves leading into areas smaller than the snake itself
+            penalty = 2.0 if area < snake_length else 1.0
+            effective_cost = length * penalty
+
+            if effective_cost < best_effective_cost:
                 result_direction = direction
-                min_distance = length
+                best_effective_cost = effective_cost
 
         if result_direction is not None:
             return MoveAction(move=result_direction)
 
-        # ── Step 5: Fallback — follow own tail ───────────────────────────────
+        # ── Step 6: Fallback — follow own tail (avoids self-enclosure) ───────
         tail = game_state.you.body[-1]
         if tail is not None:
             direction, _ = a_star_wrapper(obstacle_map, head, tail)
             if direction is not None and direction in safe_moves:
-                result_direction = direction
+                return MoveAction(move=direction)
 
-        if result_direction is not None:
-            return MoveAction(move=result_direction)
-
-        # ── Step 6: Final fallback — any safe move ───────────────────────────
-        return MoveAction(move=safe_moves[0])
+        # ── Step 7: Final fallback — most open safe direction ────────────────
+        # ranked_safe_moves[0] has the largest flood-fill area, minimising the
+        # chance of entering a dead-end corridor.
+        return MoveAction(move=ranked_safe_moves[0])
 
     def end(self, game_state: GameState):
-        """end is called when the battlesnake finishes a game"""
         if game_state.game.id in self.agent_states:
             del self.agent_states[game_state.game.id]
 
