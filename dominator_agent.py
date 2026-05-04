@@ -9,8 +9,9 @@ from battlesnake_types import Food, GameState, MoveAction, Direction, BaseAgent,
 # ── Tunable constants ────────────────────────────────────────────────────────
 HUNT_HEALTH_THRESHOLD     = 40    # Hunt only when health > this
 HUNT_MAX_DISTANCE         = 10    # Max A* steps to chase a hunt target
-SQUEEZE_HEALTH_THRESHOLD  = 40    # Squeeze only when health > this
-SQUEEZE_TERRITORY_THRESHOLD = 0.45  # Squeeze when we own > 45% in a 1v1
+SQUEEZE_HEALTH_THRESHOLD       = 40  # Squeeze only when health > this
+SQUEEZE_FOOD_INTERRUPT_HEALTH  = 55  # Within squeeze, eat first when health ≤ this
+SQUEEZE_TERRITORY_THRESHOLD    = 0.45  # Squeeze when we own > 45% in a 1v1
 COIL_HEALTH_THRESHOLD     = 40    # Coil only when health > this
 COIL_TERRITORY_THRESHOLD  = 0.50  # Coil when we control ≥ this share of territory
 URGENCY_FULL              = 70    # ≥ this health → full food-path penalties
@@ -558,15 +559,46 @@ class DominatorAgent(BaseAgent):
             and territory_ratio > SQUEEZE_TERRITORY_THRESHOLD
         )
         if should_squeeze:
-            squeeze_dir = find_squeeze_move(
-                game_state=game_state, obstacle_map=obstacle_map, head=head,
-                safe_moves=safe_moves, area_scores=area_scores,
-                risk_cells=risk_cells, territory_cells=territory_cells,
-                snake_length=snake_length, health=health,
-                territory_ratio=territory_ratio,
-            )
-            if squeeze_dir is not None:
-                return MoveAction(move=squeeze_dir)
+            # ── Health-gated food interrupt ──────────────────────────────────
+            #
+            # Health thresholds inside squeeze mode:
+            #   health > 55  → pure squeeze: advance boundary turn by turn
+            #   40 < health ≤ 55  → food interrupt: eat nearest food first,
+            #                        then resume squeezing next turn
+            #   health ≤ 40  → should_squeeze is False; falls through to the
+            #                   normal food-seeking step below
+            #
+            # This prevents The Dominator from starving while ahead — it
+            # briefly breaks off to eat, restores health to 100, then picks up
+            # exactly where it left off without losing meaningful territory.
+            if health <= SQUEEZE_FOOD_INTERRUPT_HEALTH:
+                interrupt_dir: Optional[Direction] = None
+                interrupt_cost = float('inf')
+                for food in agent_state.possible_food:
+                    d, length = a_star_wrapper(obstacle_map, head, food)
+                    if d is None or d not in safe_moves:
+                        continue
+                    penalty  = compute_food_penalties(
+                        health=health, area=area_scores[d],
+                        snake_length=snake_length, risky=is_risky(d),
+                        territory_ratio=territory_ratio,
+                    )
+                    eff_cost = length * penalty
+                    if eff_cost < interrupt_cost:
+                        interrupt_dir  = d
+                        interrupt_cost = eff_cost
+                if interrupt_dir is not None:
+                    return MoveAction(move=interrupt_dir)
+            else:
+                squeeze_dir = find_squeeze_move(
+                    game_state=game_state, obstacle_map=obstacle_map, head=head,
+                    safe_moves=safe_moves, area_scores=area_scores,
+                    risk_cells=risk_cells, territory_cells=territory_cells,
+                    snake_length=snake_length, health=health,
+                    territory_ratio=territory_ratio,
+                )
+                if squeeze_dir is not None:
+                    return MoveAction(move=squeeze_dir)
 
         # ── 9. COIL: Voronoi-driven territory patrol ──────────────────────────
         #
