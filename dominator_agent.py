@@ -7,13 +7,13 @@ from typing import Dict, List, Optional, Set, Tuple
 from battlesnake_types import Food, GameState, MoveAction, Direction, BaseAgent, Point
 
 # ── Tunable constants ────────────────────────────────────────────────────────
-HUNT_HEALTH_THRESHOLD     = 30    # Hunt more often (was 40)
-HUNT_MAX_DISTANCE         = 14    # Chase further (was 10)
+HUNT_HEALTH_THRESHOLD     = 35   # Hunt more often (was 40)
+HUNT_MAX_DISTANCE         = 8   # Chase further (was 10)
 SQUEEZE_HEALTH_THRESHOLD       = 30   # Squeeze more (was 40)
 SQUEEZE_FOOD_INTERRUPT_HEALTH  = 45   # was 55
-SQUEEZE_TERRITORY_THRESHOLD    = 0.38  # Squeeze earlier (was 0.45)
+SQUEEZE_TERRITORY_THRESHOLD    = 0.42  # Squeeze earlier (was 0.45)
 COIL_HEALTH_THRESHOLD     = 30    # was 40
-COIL_TERRITORY_THRESHOLD  = 0.45  # Coil less, be more aggressive (was 0.50)
+COIL_TERRITORY_THRESHOLD  = 0.47  # Coil less, be more aggressive (was 0.50)
 URGENCY_FULL              = 65    # Start food urgency earlier (was 70)
 URGENCY_NONE              = 15    # was 20
 TERRITORY_PRESSURE_LOW    = 0.35  # was 0.30
@@ -255,6 +255,9 @@ def find_hunt_move(
 
             direction, length = a_star_wrapper(obstacle_map, head, Point(x=tx, y=ty))
             if direction is None or direction not in safe_moves or length > HUNT_MAX_DISTANCE:
+                continue
+                 area = area_scores[direction]
+            if area < snake_length * 1.5:
                 continue
 
             area     = area_scores[direction]
