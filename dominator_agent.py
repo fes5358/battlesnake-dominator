@@ -256,11 +256,11 @@ def find_hunt_move(
             direction, length = a_star_wrapper(obstacle_map, head, Point(x=tx, y=ty))
             if direction is None or direction not in safe_moves or length > HUNT_MAX_DISTANCE:
                 continue
-                 area = area_scores[direction]
+            area = area_scores[direction]
             if area < snake_length * 1.5:
                 continue
 
-            area     = area_scores[direction]
+            
             risky    = (head.x + direction.dx, head.y + direction.dy) in risk_cells
             eff_cost = length * compute_food_penalties(health, area, snake_length, risky, territory_ratio)
 
