@@ -7,16 +7,16 @@ from typing import Dict, List, Optional, Set, Tuple
 from battlesnake_types import Food, GameState, MoveAction, Direction, BaseAgent, Point
 
 # ── Tunable constants ────────────────────────────────────────────────────────
-HUNT_HEALTH_THRESHOLD     = 40    # Hunt only when health > this
-HUNT_MAX_DISTANCE         = 10    # Max A* steps to chase a hunt target
-SQUEEZE_HEALTH_THRESHOLD       = 40  # Squeeze only when health > this
-SQUEEZE_FOOD_INTERRUPT_HEALTH  = 55  # Within squeeze, eat first when health ≤ this
-SQUEEZE_TERRITORY_THRESHOLD    = 0.45  # Squeeze when we own > 45% in a 1v1
-COIL_HEALTH_THRESHOLD     = 40    # Coil only when health > this
-COIL_TERRITORY_THRESHOLD  = 0.50  # Coil when we control ≥ this share of territory
-URGENCY_FULL              = 70    # ≥ this health → full food-path penalties
-URGENCY_NONE              = 20    # ≤ this health → zero penalties (desperation)
-TERRITORY_PRESSURE_LOW    = 0.30  # Below this ratio → extra food urgency applied
+HUNT_HEALTH_THRESHOLD     = 30    # Hunt more often (was 40)
+HUNT_MAX_DISTANCE         = 14    # Chase further (was 10)
+SQUEEZE_HEALTH_THRESHOLD       = 30   # Squeeze more (was 40)
+SQUEEZE_FOOD_INTERRUPT_HEALTH  = 45   # was 55
+SQUEEZE_TERRITORY_THRESHOLD    = 0.38  # Squeeze earlier (was 0.45)
+COIL_HEALTH_THRESHOLD     = 30    # was 40
+COIL_TERRITORY_THRESHOLD  = 0.45  # Coil less, be more aggressive (was 0.50)
+URGENCY_FULL              = 65    # Start food urgency earlier (was 70)
+URGENCY_NONE              = 15    # was 20
+TERRITORY_PRESSURE_LOW    = 0.35  # was 0.30
 
 
 # ---------------------------------------------------------
