@@ -7,8 +7,8 @@ from typing import Dict, List, Optional, Set, Tuple
 from battlesnake_types import Food, GameState, MoveAction, Direction, BaseAgent, Point
 
 # ── Tunable constants ────────────────────────────────────────────────────────
-HUNT_HEALTH_THRESHOLD     = 50   # Hunt more often (was 40)
-HUNT_MAX_DISTANCE         = 6  # Chase further (was 10)
+HUNT_HEALTH_THRESHOLD     = 35   # Hunt more often (was 40)
+HUNT_MAX_DISTANCE         = 8  # Chase further (was 10)
 SQUEEZE_HEALTH_THRESHOLD       = 30   # Squeeze more (was 40)
 SQUEEZE_FOOD_INTERRUPT_HEALTH  = 45   # was 55
 SQUEEZE_TERRITORY_THRESHOLD    = 0.42  # Squeeze earlier (was 0.45)
@@ -136,7 +136,7 @@ def get_head_collision_risks(game_state: GameState) -> Set[Tuple[int, int]]:
     for snake in game_state.board.snakes:
         if snake.id == my_id or snake.head is None:
             continue
-        if (snake.length or len(snake.body)) >= snake_length - 2:
+        if (snake.length or len(snake.body)) < snake_length:
             continue
         for d in Direction:
             nx, ny = snake.head.x + d.dx, snake.head.y + d.dy
