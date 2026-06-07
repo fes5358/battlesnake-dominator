@@ -33,6 +33,14 @@ MIN_AREA_RATIO                 = 1.0
 LOOKAHEAD_AREA_WEIGHT          = 0.3   # weight of min-future-area in food cost
 LOOKAHEAD_MIN_EXITS            = 2     # soft-prefer moves with ≥ this many future exits
 
+# Territory control — flood-fill Voronoi per move + active cut-off
+TERRITORY_GAIN_WEIGHT          = 0.4   # tiebreaker weight for territory gain in rank_key
+CUTOFF_OPP_AREA_THRESHOLD      = 0.55  # attempt cut-off when opponent area < this × their_length
+CUTOFF_MAX_DISTANCE            = 7     # max A* steps allowed to reach a cut-off target
+CUTOFF_HEALTH_THRESHOLD        = 40    # only attempt cut-off when health > this
+TERRITORY_TREND_WINDOW         = 5     # turns of territory ratio history to track
+TERRITORY_DECLINING_THRESHOLD  = -0.04 # per-turn ratio drop → treat as extra food urgency
+
 
 # ---------------------------------------------------------
 # Health-aware food penalty helpers
@@ -399,6 +407,191 @@ def compute_voronoi(
 
 
 # ---------------------------------------------------------
+# Territory gain per move — post-move Voronoi simulation
+# ---------------------------------------------------------
+def _voronoi_bfs(
+    grid: np.ndarray,
+    seeds: List[Tuple[Tuple[int, int], str]],
+) -> Dict[Tuple[int, int], str]:
+    """
+    Multi-source BFS Voronoi.  seeds = [(row, col), snake_id] list.
+    Returns {(row,col): owner_id} for non-contested cells.
+    """
+    h, w = grid.shape
+    cell_owner: Dict[Tuple[int, int], str] = {}
+    cell_dist:  Dict[Tuple[int, int], int] = {}
+    q: deque = deque()
+
+    for (r, c), sid in seeds:
+        if not (0 <= r < h and 0 <= c < w) or grid[r, c]:
+            continue
+        pos = (r, c)
+        if pos not in cell_dist:
+            cell_dist[pos]  = 0
+            cell_owner[pos] = sid
+            q.append(pos)
+        elif cell_owner[pos] != sid:
+            cell_owner[pos] = CONTESTED
+
+    while q:
+        r, c = q.popleft()
+        owner = cell_owner.get((r, c), CONTESTED)
+        if owner == CONTESTED:
+            continue
+        dist = cell_dist[(r, c)]
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < h and 0 <= nc < w) or grid[nr, nc]:
+                continue
+            new_dist = dist + 1
+            pos = (nr, nc)
+            if pos not in cell_dist:
+                cell_dist[pos]  = new_dist
+                cell_owner[pos] = owner
+                q.append(pos)
+            elif cell_dist[pos] == new_dist and cell_owner[pos] != owner:
+                cell_owner[pos] = CONTESTED
+
+    return cell_owner
+
+
+def compute_territory_per_move(
+    survival_moves: List[Direction],
+    head: Point,
+    game_state: GameState,
+    obstacle_map: np.ndarray,
+) -> Dict[Direction, int]:
+    """
+    For each candidate move, simulate our head at the new position and run
+    a fast Voronoi BFS.  Returns how many cells we would own after each move.
+
+    Used as a tiebreaker in move ranking (prefer moves that expand our territory)
+    and to detect whether a move actively cuts into an opponent's space.
+    Runs ≤4 BFS passes of O(board_size) — typically <0.5 ms total.
+    """
+    my_id  = game_state.you.id
+    body   = game_state.you.body
+    tail   = body[-1] if body else None
+    h, w   = obstacle_map.shape
+
+    # Opponent seed positions (constant across all candidate moves)
+    opp_seeds = [
+        ((s.head.y, s.head.x), s.id)
+        for s in game_state.board.snakes
+        if s.id != my_id and s.head is not None
+        and 0 <= s.head.y < h and 0 <= s.head.x < w
+    ]
+
+    scores: Dict[Direction, int] = {}
+    for d in survival_moves:
+        new_hx = head.x + d.dx
+        new_hy = head.y + d.dy
+
+        sim = obstacle_map.copy()
+        # Tail slides away unless we just ate
+        if tail and _tail_not_duplicated(body, tail):
+            if 0 <= tail.y < h and 0 <= tail.x < w:
+                sim[tail.y, tail.x] = False
+        # Our new head is free (we occupy it, not an obstacle for BFS)
+        if 0 <= new_hy < h and 0 <= new_hx < w:
+            sim[new_hy, new_hx] = False
+
+        seeds = [((new_hy, new_hx), my_id)] + opp_seeds
+        cell_owner = _voronoi_bfs(sim, seeds)
+        scores[d] = sum(1 for v in cell_owner.values() if v == my_id)
+
+    return scores
+
+
+def territory_trend(history: List[float]) -> float:
+    """
+    Mean per-turn change in our Voronoi territory ratio over the last
+    TERRITORY_TREND_WINDOW turns.  Negative = we are losing territory.
+    Zero or positive = holding / expanding.
+    """
+    if len(history) < 2:
+        return 0.0
+    diffs = [history[i] - history[i - 1] for i in range(1, len(history))]
+    return sum(diffs) / len(diffs)
+
+
+def find_cutoff_move(
+    game_state: GameState,
+    obstacle_map: np.ndarray,
+    hazard_grid: np.ndarray,
+    head: Point,
+    safe_moves: List[Direction],
+    territory_counts: Dict[str, int],
+    territory_cells: Dict[str, Set[Tuple[int, int]]],
+    snake_length: int,
+    risk_cells: Set[Tuple[int, int]],
+) -> Optional[Direction]:
+    """
+    Active territory cut-off: if an opponent's Voronoi area is below
+    CUTOFF_OPP_AREA_THRESHOLD × their snake length, they are already squeezed.
+    Route toward the boundary of their territory to close off their remaining
+    escape routes — the "boxing in" manoeuvre.
+
+    Boundary cells are scored by depth (surrounded by more opponent cells =
+    better cut-off position) divided by distance from our head.
+    """
+    my_id     = game_state.you.id
+    our_cells = territory_cells.get(my_id, set())
+    best_direction: Optional[Direction] = None
+    best_priority  = -1.0
+
+    for snake in game_state.board.snakes:
+        if snake.id == my_id or snake.head is None:
+            continue
+        opp_length = snake.length or len(snake.body)
+        opp_area   = territory_counts.get(snake.id, 0)
+        opp_cells  = territory_cells.get(snake.id, set())
+
+        if opp_area > CUTOFF_OPP_AREA_THRESHOLD * opp_length:
+            continue  # not squeezed enough — skip
+        if not opp_cells:
+            continue
+
+        # Find boundary cells: opponent cells adjacent to our territory or open space
+        boundary: List[Tuple[int, int]] = []
+        for r, c in opp_cells:
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nb = (r + dr, c + dc)
+                if nb in our_cells or nb not in opp_cells:
+                    boundary.append((r, c))
+                    break
+
+        if not boundary:
+            boundary = list(opp_cells)  # fallback: any opponent cell
+
+        def cell_priority(pos: Tuple[int, int]) -> float:
+            r, c = pos
+            # depth = how many opp-cell neighbours → prefer cutting deeper
+            depth = sum(
+                1 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]
+                if (r + dr, c + dc) in opp_cells
+            )
+            dist = max(1, abs(r - head.y) + abs(c - head.x))
+            return (depth + 1) / dist
+
+        target_rc = max(boundary, key=cell_priority)
+        target    = Point(x=target_rc[1], y=target_rc[0])
+
+        direction, dist = a_star_wrapper(obstacle_map, hazard_grid, head, target)
+        if direction is None or direction not in safe_moves or dist > CUTOFF_MAX_DISTANCE:
+            continue
+        if (head.x + direction.dx, head.y + direction.dy) in risk_cells:
+            continue
+
+        priority = cell_priority(target_rc) / max(1, dist)
+        if priority > best_priority:
+            best_direction = direction
+            best_priority  = priority
+
+    return best_direction
+
+
+# ---------------------------------------------------------
 # Hunting
 # ---------------------------------------------------------
 def find_hunt_move(
@@ -567,6 +760,7 @@ def find_coil_move(
 @dataclass
 class AgentState:
     possible_food: list[Food] = field(default_factory=list)
+    territory_history: list[float] = field(default_factory=list)
 
 
 class DominatorAgent(BaseAgent):
@@ -636,42 +830,54 @@ class DominatorAgent(BaseAgent):
             return (head.x + d.dx, head.y + d.dy) in risk_cells
 
         # ── 6. Minimax 2-step lookahead ───────────────────────────────────────
-        #
-        # For each candidate move, simulate one turn ahead and one opponent
-        # response.  Tracks worst-case future area, exits, and head-collision
-        # safety.  Runs in ~0.02 ms on a 15×15 board — negligible overhead.
-        #
-        # Used to:
-        #   a) break ties in the final move ranking
-        #   b) apply a small discount to food-path costs (prefer routes that
-        #      leave more future options even in worst-case opponent scenarios)
         lookahead_scores = compute_lookahead_scores(
             survival_moves, head, game_state, obstacle_map, snake_length
         )
 
-        # ── 7. Ranked survival moves ──────────────────────────────────────────
+        # ── 7. Voronoi territory map + per-move territory gain ────────────────
         #
-        # Primary sort criteria (descending = best first):
-        #   (not_risky, la_head_safe, la_exits_ok, area, la_future_area)
-        def rank_key(d: Direction) -> Tuple:
-            la = lookahead_scores.get(d)
-            la_area, la_exits, la_safe = la if la else (area_scores[d], 4, True)
-            return (
-                0 if is_risky(d)                          else 1,  # avoid risky
-                0 if (not la or not la_safe)               else 1,  # lookahead head-safe
-                0 if la_exits < LOOKAHEAD_MIN_EXITS        else 1,  # lookahead exits ok
-                area_scores[d],                                      # current area
-                la_area,                                             # worst-case future area
-            )
-
-        ranked_safe_moves = sorted(survival_moves, key=rank_key, reverse=True)
-
-        # ── 8. Voronoi territory map ──────────────────────────────────────────
+        # Run Voronoi BFS once for the current board state (territory_counts /
+        # territory_cells), then run a post-move simulation for each candidate
+        # move (territory_gain_scores) so we can prefer moves that expand our
+        # zone over moves that cede cells to opponents.
         territory_counts, territory_cells = compute_voronoi(game_state, obstacle_map)
         our_cells       = territory_cells.get(game_state.you.id, set())
         our_count       = territory_counts.get(game_state.you.id, 0)
         total_claimed   = sum(territory_counts.values())
         territory_ratio = our_count / max(1, total_claimed)
+
+        territory_gain_scores = compute_territory_per_move(
+            survival_moves, head, game_state, obstacle_map
+        )
+
+        # ── 7a. Territory trend — extra food urgency when being squeezed ──────
+        agent_state.territory_history.append(territory_ratio)
+        if len(agent_state.territory_history) > TERRITORY_TREND_WINDOW:
+            agent_state.territory_history = agent_state.territory_history[-TERRITORY_TREND_WINDOW:]
+        trend = territory_trend(agent_state.territory_history)
+        # Declining territory ratio → treat snake as hungrier than it is so A*
+        # routes toward food more aggressively to maintain board presence.
+        trend_health_penalty = max(0.0, -trend / max(0.001, abs(TERRITORY_DECLINING_THRESHOLD))) * 15.0
+        effective_health = max(0, health - int(trend_health_penalty))
+
+        # ── 8. Ranked survival moves ──────────────────────────────────────────
+        #
+        # Sort criteria (descending):
+        #   not_risky → la_head_safe → la_exits_ok → area → la_future_area → territory_gain
+        def rank_key(d: Direction) -> Tuple:
+            la = lookahead_scores.get(d)
+            la_area, la_exits, la_safe = la if la else (area_scores[d], 4, True)
+            tg = territory_gain_scores.get(d, 0)
+            return (
+                0 if is_risky(d)                          else 1,
+                0 if (not la or not la_safe)               else 1,
+                0 if la_exits < LOOKAHEAD_MIN_EXITS        else 1,
+                area_scores[d],
+                la_area,
+                tg,
+            )
+
+        ranked_safe_moves = sorted(survival_moves, key=rank_key, reverse=True)
 
         # ── 9. Food memory (Blackout limited-vision support) ──────────────────
         view_radius = game_state.game.ruleset.settings.viewRadius
@@ -690,6 +896,11 @@ class DominatorAgent(BaseAgent):
         else:
             agent_state.possible_food = list(game_state.board.food)
 
+        visible_opponents = [
+            s for s in game_state.board.snakes
+            if s.id != game_state.you.id and s.head is not None
+        ]
+
         # ── 10. HUNT: intercept a visible smaller opponent ────────────────────
         if health > HUNT_HEALTH_THRESHOLD and len(survival_moves) > 1:
             hunt_dir = find_hunt_move(
@@ -698,16 +909,31 @@ class DominatorAgent(BaseAgent):
                 safe_moves=survival_moves, area_scores=area_scores,
                 lookahead_scores=lookahead_scores,
                 snake_length=snake_length, risk_cells=risk_cells,
-                health=health, territory_ratio=territory_ratio,
+                health=effective_health, territory_ratio=territory_ratio,
             )
             if hunt_dir is not None:
                 return MoveAction(move=hunt_dir)
 
-        # ── 11. SQUEEZE: late-game boundary compression ───────────────────────
-        visible_opponents = [
-            s for s in game_state.board.snakes
-            if s.id != game_state.you.id and s.head is not None
-        ]
+        # ── 11. CUT-OFF: actively box in a squeezed opponent ─────────────────
+        #
+        # When an opponent's Voronoi territory < CUTOFF_OPP_AREA_THRESHOLD ×
+        # their snake length they are already losing the space war.  Route to
+        # the boundary of their zone to close off remaining escape routes.
+        # Unlike SQUEEZE (1v1 only, requires us to be winning), CUT-OFF fires
+        # whenever any visible opponent is squeezed — including multi-snake games.
+        if health > CUTOFF_HEALTH_THRESHOLD and len(survival_moves) > 1:
+            cutoff_dir = find_cutoff_move(
+                game_state=game_state, obstacle_map=obstacle_map,
+                hazard_grid=hazard_grid, head=head,
+                safe_moves=survival_moves,
+                territory_counts=territory_counts,
+                territory_cells=territory_cells,
+                snake_length=snake_length, risk_cells=risk_cells,
+            )
+            if cutoff_dir is not None:
+                return MoveAction(move=cutoff_dir)
+
+        # ── 12. SQUEEZE: late-game boundary compression (1v1) ─────────────────
         should_squeeze = (
             len(visible_opponents) == 1
             and health > SQUEEZE_HEALTH_THRESHOLD
@@ -715,10 +941,10 @@ class DominatorAgent(BaseAgent):
         )
         if should_squeeze:
             if health <= SQUEEZE_FOOD_INTERRUPT_HEALTH:
-                interrupt_dir  = _best_food_direction(
+                interrupt_dir = _best_food_direction(
                     agent_state, obstacle_map, hazard_grid, head,
                     survival_moves, area_scores, lookahead_scores,
-                    snake_length, risk_cells, health, territory_ratio,
+                    snake_length, risk_cells, effective_health, territory_ratio,
                     width, height,
                 )
                 if interrupt_dir is not None:
@@ -729,13 +955,13 @@ class DominatorAgent(BaseAgent):
                     hazard_grid=hazard_grid, head=head,
                     safe_moves=survival_moves, area_scores=area_scores,
                     risk_cells=risk_cells, territory_cells=territory_cells,
-                    snake_length=snake_length, health=health,
+                    snake_length=snake_length, health=effective_health,
                     territory_ratio=territory_ratio,
                 )
                 if squeeze_dir is not None:
                     return MoveAction(move=squeeze_dir)
 
-        # ── 12. COIL: Voronoi-driven territory patrol ─────────────────────────
+        # ── 13. COIL: Voronoi-driven territory patrol ─────────────────────────
         should_coil = (
             health > COIL_HEALTH_THRESHOLD
             and territory_ratio >= COIL_TERRITORY_THRESHOLD
@@ -751,20 +977,14 @@ class DominatorAgent(BaseAgent):
             if coil_dir is not None:
                 return MoveAction(move=coil_dir)
 
-        # ── 13. FOOD: health + territory + lookahead-aware food seeking ────────
+        # ── 14. FOOD: health + territory + lookahead-aware food seeking ────────
         #
-        # A* cost per cell includes:
-        #   • Hazard penalty       — routes around Royale hazard zones
-        #   • Wall-proximity penalty — prefers paths through open board centre
-        #   • Area/risk penalties  — avoids cramped or head-on-risky paths
-        #   • Lookahead discount   — slight bonus for moves with more future exits
-        #
-        # Together these replace the previous behaviour of blindly routing to
-        # the nearest food, which drove the snake into wall corners and killed it.
+        # Uses effective_health (= health − trend_health_penalty) so a declining
+        # territory ratio makes the snake act hungrier and seek food earlier.
         result_direction = _best_food_direction(
             agent_state, obstacle_map, hazard_grid, head,
             survival_moves, area_scores, lookahead_scores,
-            snake_length, risk_cells, health, territory_ratio,
+            snake_length, risk_cells, effective_health, territory_ratio,
             width, height,
         )
         if result_direction is not None:
