@@ -37,13 +37,17 @@ def run_once() -> dict:
 
     adjustments = report.get("recommended_adjustments", [])
     if not adjustments:
+        analyzer.record_history(report, [])
         log.info("No adjustments recommended this cycle.")
         return {"status": "no_adjustments", "report": report}
 
     applied = analyzer.apply_adjustments(adjustments)
     if not applied:
+        analyzer.record_history(report, [])
         log.info("Adjustments computed but none could be applied.")
         return {"status": "no_applied", "report": report}
+
+    analyzer.record_history(report, applied)
 
     log.info(f"Applied {len(applied)} constant change(s). Pushing to GitHub...")
     with open(AGENT_FILE) as f:

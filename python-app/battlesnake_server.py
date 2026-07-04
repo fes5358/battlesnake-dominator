@@ -88,6 +88,7 @@ def start_server(agent: BaseAgent, port):
             analyzer = TournamentAnalyzer()
             report   = analyzer.run_analysis(games=n_games)
 
+            applied = []
             if apply_changes:
                 adjs    = report.get("recommended_adjustments", [])
                 applied = analyzer.apply_adjustments(adjs)
@@ -100,6 +101,7 @@ def start_server(agent: BaseAgent, port):
                         "Constants updated. Restart the Python App workflow "
                         "to activate changes."
                     )
+            analyzer.record_history(report, applied)
             return jsonify(report)
 
         except Exception as exc:
@@ -120,6 +122,41 @@ def start_server(agent: BaseAgent, port):
             return jsonify(result)
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
+
+    @app.get("/status")
+    def on_status():
+        """
+        Human-readable dashboard: current leaderboard rating/rank, current
+        tuning constants, and a chart of avg-death-turn improvement over time
+        drawn from tuning_history.json.
+        """
+        sys.path.insert(0, os.path.dirname(__file__))
+        from self_improve import TournamentAnalyzer, load_history
+        from status_page import render_status_page
+
+        try:
+            analyzer = TournamentAnalyzer()
+            rating   = analyzer.get_leaderboard_rating()
+        except Exception:
+            rating = None
+
+        history = load_history()
+        html = render_status_page(rating, history)
+        return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+    @app.get("/status.json")
+    def on_status_json():
+        """Raw JSON version of the /status dashboard data."""
+        sys.path.insert(0, os.path.dirname(__file__))
+        from self_improve import TournamentAnalyzer, load_history
+
+        try:
+            analyzer = TournamentAnalyzer()
+            rating   = analyzer.get_leaderboard_rating()
+        except Exception:
+            rating = None
+
+        return jsonify({"rating": rating, "history": load_history()})
 
     host = "0.0.0.0"
 

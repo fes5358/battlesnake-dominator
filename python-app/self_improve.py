@@ -46,6 +46,9 @@ TOURNAMENT_BASE = "https://www.tnt.uni-hannover.de/bs-blackout-2026"
 SNAKE_PAGE_ID   = 14          # numeric ID on the tournament site
 AGENT_FILE      = os.path.join(os.path.dirname(__file__), "dominator_agent.py")
 LOG_FILE        = os.path.join(os.path.dirname(__file__), "self_improve.log")
+HISTORY_FILE    = os.path.join(os.path.dirname(__file__), "tuning_history.json")
+HISTORY_MAX     = 200
+LEADERBOARD_URL = TOURNAMENT_BASE + "/"
 
 # ── Tuning rules ────────────────────────────────────────────────────────────
 # Each rule: (death_cause, pct_threshold, const_name, delta, lo, hi)
@@ -89,6 +92,18 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
+
+
+# ── History persistence (module-level, shared by CLI + web endpoints) ───────
+def load_history() -> List[dict]:
+    """Load tuning_history.json, returning [] if it doesn't exist yet."""
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    try:
+        with open(HISTORY_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
 
 
 # ── Data classes ─────────────────────────────────────────────────────────────
@@ -159,6 +174,36 @@ class TournamentAnalyzer:
                 seen.add(gid)
                 unique.append(int(gid))
         return unique[:n]
+
+    def get_leaderboard_rating(self, snake_id: int = SNAKE_PAGE_ID) -> Optional[dict]:
+        """
+        Scrape the tournament leaderboard for our current rank + rating.
+        Returns {"rank": int, "name": str, "rating": float} or None if not found.
+        """
+        try:
+            resp = self.session.get(LEADERBOARD_URL, timeout=15)
+            resp.raise_for_status()
+        except Exception as exc:
+            log.warning(f"Failed to fetch leaderboard: {exc}")
+            return None
+
+        href = f'/bs-blackout-2026/snake/{snake_id}'
+        pattern = re.compile(
+            r'<td[^>]*>\s*(?:<[^>]*>)?\s*([^<]*?)\s*(?:</[^>]*>)?\s*</td>\s*'
+            r'<td[^>]*><a href="' + re.escape(href) + r'">([^<]+)</a></td>\s*'
+            r'<td[^>]*>\s*([\d.]+)\s*</td>',
+            re.DOTALL,
+        )
+        m = pattern.search(resp.text)
+        if not m:
+            return None
+        pos_raw, name, rating = m.groups()
+        pos_raw = re.sub(r'[^\d]', '', pos_raw) or None
+        return {
+            "rank":   int(pos_raw) if pos_raw else None,
+            "name":   name.strip(),
+            "rating": float(rating),
+        }
 
     def get_replay(self, game_id: int) -> Optional[dict]:
         url = f"{TOURNAMENT_BASE}/api/replay/{game_id}"
@@ -312,6 +357,31 @@ class TournamentAnalyzer:
             log.info(f"Wrote {len(applied)} change(s) to {AGENT_FILE}")
 
         return applied
+
+    # ── History persistence ────────────────────────────────────────────────
+
+    def record_history(self, report: dict, applied: Optional[List[dict]] = None) -> None:
+        """Append a compact snapshot of this run to tuning_history.json."""
+        entry = {
+            "timestamp":           report.get("timestamp", datetime.now().isoformat()),
+            "total_games_checked": report.get("total_games_checked", 0),
+            "deaths_analyzed":     report.get("deaths_analyzed", 0),
+            "win_rate_approx":     report.get("win_rate_approx", 0),
+            "avg_death_turn":      report.get("avg_death_turn", 0),
+            "avg_health_at_death": report.get("avg_health_at_death", 0),
+            "death_causes":        report.get("death_causes", {}),
+            "constants":           report.get("current_constants", {}),
+            "applied": [
+                {"constant": a["constant"], "old": a["current"], "new": a["new"]}
+                for a in (applied or [])
+            ],
+        }
+
+        history = load_history()
+        history.append(entry)
+        history = history[-HISTORY_MAX:]
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(history, f, indent=2)
 
     # ── Full analysis run ─────────────────────────────────────────────────
 
