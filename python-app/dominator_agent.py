@@ -41,6 +41,26 @@ CUTOFF_HEALTH_THRESHOLD        = 40    # only attempt cut-off when health > this
 TERRITORY_TREND_WINDOW         = 5     # turns of territory ratio history to track
 TERRITORY_DECLINING_THRESHOLD  = -0.04 # per-turn ratio drop → treat as extra food urgency
 
+# Blackout visibility safety
+# In Blackout mode (viewRadius=5) we cannot see snakes outside our vision circle.
+# Enemy bodies can be at cells that appear empty on our obstacle map.  By adding a
+# large A* cost to cells at or beyond the vision boundary we bias the snake toward
+# paths that stay inside confirmed-safe territory and away from the blind spot.
+BLACKOUT_BORDER_COST           = 4.5  # A* penalty per cell at/beyond vision radius
+
+# Ghost snake memory (Blackout mode)
+# When an opponent disappears beyond our vision circle we keep their last-known
+# body positions in memory.  For snakes seen exactly 1 turn ago we inject those
+# cells as hard obstacles (body hasn't moved far enough to vacate them yet).
+# For 2-3 turn old ghosts we add projected head positions to risk_cells so the
+# ranker soft-avoids them.
+GHOST_MAX_AGE                  = 5    # turns to keep ghost memory before discarding
+
+# Wall proximity — named constants so self_improve.py can auto-tune them via regex.
+WALL_EDGE_COST                 = 3.5  # A* penalty at dist=0 (on the board edge)
+WALL_NEAR_COST                 = 0.8  # A* penalty at dist=1
+WALL_BUFFER_COST               = 0.3  # A* penalty at dist=2
+
 
 # ---------------------------------------------------------
 # Health-aware food penalty helpers
@@ -66,16 +86,16 @@ def compute_food_penalties(
 def wall_proximity_penalty(x: int, y: int, width: int, height: int) -> float:
     """
     Extra A* step cost for cells near the board edge.  Makes paths through the
-    open centre naturally preferred over wall-hugging routes — the primary cause
-    of the early deaths seen in replay analysis (median death turn 14).
+    open centre naturally preferred over wall-hugging routes.
+    Uses module-level WALL_*_COST constants so self_improve.py can auto-tune them.
     """
     dist = min(x, width - 1 - x, y, height - 1 - y)
     if dist == 0:
-        return 1.5
+        return WALL_EDGE_COST
     if dist == 1:
-        return 0.8
+        return WALL_NEAR_COST
     if dist == 2:
-        return 0.3
+        return WALL_BUFFER_COST
     return 0.0
 
 
@@ -525,6 +545,8 @@ def find_cutoff_move(
     territory_cells: Dict[str, Set[Tuple[int, int]]],
     snake_length: int,
     risk_cells: Set[Tuple[int, int]],
+    view_center: Optional[Tuple[int, int]] = None,
+    view_radius: Optional[int] = None,
 ) -> Optional[Direction]:
     """
     Active territory cut-off: if an opponent's Voronoi area is below
@@ -577,7 +599,8 @@ def find_cutoff_move(
         target_rc = max(boundary, key=cell_priority)
         target    = Point(x=target_rc[1], y=target_rc[0])
 
-        direction, dist = a_star_wrapper(obstacle_map, hazard_grid, head, target)
+        direction, dist = a_star_wrapper(obstacle_map, hazard_grid, head, target,
+                                         view_center=view_center, view_radius=view_radius)
         if direction is None or direction not in safe_moves or dist > CUTOFF_MAX_DISTANCE:
             continue
         if (head.x + direction.dx, head.y + direction.dy) in risk_cells:
@@ -606,6 +629,8 @@ def find_hunt_move(
     risk_cells: Set[Tuple[int, int]],
     health: int,
     territory_ratio: float,
+    view_center: Optional[Tuple[int, int]] = None,
+    view_radius: Optional[int] = None,
 ) -> Optional[Direction]:
     """Route toward a cell adjacent to a smaller opponent's head."""
     my_id = game_state.you.id
@@ -625,7 +650,8 @@ def find_hunt_move(
             if obstacle_map[ty, tx]:
                 continue
 
-            direction, length = a_star_wrapper(obstacle_map, hazard_grid, head, Point(x=tx, y=ty))
+            direction, length = a_star_wrapper(obstacle_map, hazard_grid, head, Point(x=tx, y=ty),
+                                               view_center=view_center, view_radius=view_radius)
             if direction is None or direction not in safe_moves or length > HUNT_MAX_DISTANCE:
                 continue
 
@@ -761,6 +787,10 @@ def find_coil_move(
 class AgentState:
     possible_food: list[Food] = field(default_factory=list)
     territory_history: list[float] = field(default_factory=list)
+    # Ghost snake memory: {snake_id: ([(row,col),...], turn_last_seen)}
+    # Populated each turn with visible opponents; used to inject invisible
+    # snake body positions as hard obstacles (1 turn ago) or risk cells (2-3 turns ago).
+    snake_memory: dict = field(default_factory=dict)
 
 
 class DominatorAgent(BaseAgent):
@@ -791,6 +821,12 @@ class DominatorAgent(BaseAgent):
         width         = game_state.board.width
         height        = game_state.board.height
 
+        # Blackout vision parameters — set once, threaded through all A* calls so
+        # that routing away from the visible area is penalised everywhere, not just
+        # in food seeking.  view_center is (row, col) = (head.y, head.x).
+        view_radius = game_state.game.ruleset.settings.viewRadius
+        view_center: Optional[Tuple[int, int]] = (head.y, head.x) if view_radius is not None else None
+
         # ── 1. Obstacle map ──────────────────────────────────────────────────
         # Use hazard cells as hard walls when we have enough health to
         # honour them.  The A* cost penalty keeps routing around them even
@@ -802,6 +838,34 @@ class DominatorAgent(BaseAgent):
         )
         obstacle_map = get_obstacle_map(game_state, include_hazards=include_hazards)
         hazard_grid  = get_hazard_grid(game_state)
+
+        # ── 1b. Ghost snake memory (Blackout mode) ────────────────────────────
+        #
+        # In Blackout, opponents outside viewRadius disappear from the board
+        # even though their bodies still occupy those cells.  We remember their
+        # last-seen body positions and inject them as hard obstacles (turn_ago=1)
+        # or risk cells (turn_ago=2-3).  The ghost map is only adopted when it
+        # still leaves ≥1 safe move — so it never hard-blocks us in a dead end.
+        visible_ids: set = {s.id for s in game_state.board.snakes}
+        if view_radius is not None:
+            for s in game_state.board.snakes:
+                if s.id != game_state.you.id and s.head is not None and s.body:
+                    body_rc = [(b.y, b.x) for b in s.body if b is not None]
+                    agent_state.snake_memory[s.id] = (body_rc, game_state.turn)
+            agent_state.snake_memory = {
+                sid: val for sid, val in agent_state.snake_memory.items()
+                if game_state.turn - val[1] <= GHOST_MAX_AGE
+            }
+            ghost_map = obstacle_map.copy()
+            for snake_id, (body_rc, turn_seen) in agent_state.snake_memory.items():
+                if snake_id in visible_ids or snake_id == game_state.you.id:
+                    continue
+                if game_state.turn - turn_seen == 1:
+                    for r, c in body_rc[:-1]:
+                        if 0 <= r < height and 0 <= c < width:
+                            ghost_map[r, c] = True
+            if get_safe_moves(game_state, ghost_map):
+                obstacle_map = ghost_map
 
         # ── 2. Safe moves — absolute hard filter ─────────────────────────────
         safe_moves = get_safe_moves(game_state, obstacle_map)
@@ -825,6 +889,22 @@ class DominatorAgent(BaseAgent):
 
         # ── 5. Head-collision risk cells ──────────────────────────────────────
         risk_cells = get_head_collision_risks(game_state)
+
+        # ── 5b. Ghost head risk cells (Blackout mode) ─────────────────────────
+        # Snakes that vanished 2-3 turns ago could have their head anywhere
+        # within 2-3 steps of the last-known position.  Mark the ghost head +
+        # its 4 neighbours as risky so the ranker soft-avoids those cells.
+        if view_radius is not None:
+            for snake_id, (body_rc, turn_seen) in agent_state.snake_memory.items():
+                if snake_id in visible_ids or snake_id == game_state.you.id:
+                    continue
+                turns_ago = game_state.turn - turn_seen
+                if 1 <= turns_ago <= 3 and body_rc:
+                    gr, gc = body_rc[0]
+                    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)]:
+                        nr, nc = gr + dr, gc + dc
+                        if 0 <= nr < height and 0 <= nc < width:
+                            risk_cells.add((nc, nr))  # risk_cells uses (x, y) = (col, row)
 
         def is_risky(d: Direction) -> bool:
             return (head.x + d.dx, head.y + d.dy) in risk_cells
@@ -880,7 +960,6 @@ class DominatorAgent(BaseAgent):
         ranked_safe_moves = sorted(survival_moves, key=rank_key, reverse=True)
 
         # ── 9. Food memory (Blackout limited-vision support) ──────────────────
-        view_radius = game_state.game.ruleset.settings.viewRadius
         if view_radius is not None:
             vision_mask = get_vision_mask(
                 width=width, height=height, center=head, radius=view_radius,
@@ -910,6 +989,7 @@ class DominatorAgent(BaseAgent):
                 lookahead_scores=lookahead_scores,
                 snake_length=snake_length, risk_cells=risk_cells,
                 health=effective_health, territory_ratio=territory_ratio,
+                view_center=view_center, view_radius=view_radius,
             )
             if hunt_dir is not None:
                 return MoveAction(move=hunt_dir)
@@ -929,6 +1009,7 @@ class DominatorAgent(BaseAgent):
                 territory_counts=territory_counts,
                 territory_cells=territory_cells,
                 snake_length=snake_length, risk_cells=risk_cells,
+                view_center=view_center, view_radius=view_radius,
             )
             if cutoff_dir is not None:
                 return MoveAction(move=cutoff_dir)
@@ -946,6 +1027,7 @@ class DominatorAgent(BaseAgent):
                     survival_moves, area_scores, lookahead_scores,
                     snake_length, risk_cells, effective_health, territory_ratio,
                     width, height,
+                    view_center=view_center, view_radius=view_radius,
                 )
                 if interrupt_dir is not None:
                     return MoveAction(move=interrupt_dir)
@@ -986,6 +1068,7 @@ class DominatorAgent(BaseAgent):
             survival_moves, area_scores, lookahead_scores,
             snake_length, risk_cells, effective_health, territory_ratio,
             width, height,
+            view_center=view_center, view_radius=view_radius,
         )
         if result_direction is not None:
             return MoveAction(move=result_direction)
@@ -993,7 +1076,8 @@ class DominatorAgent(BaseAgent):
         # ── 14. Follow own tail ───────────────────────────────────────────────
         tail = game_state.you.body[-1]
         if tail is not None and ranked_safe_moves:
-            direction, _ = a_star_wrapper(obstacle_map, hazard_grid, head, tail)
+            direction, _ = a_star_wrapper(obstacle_map, hazard_grid, head, tail,
+                                          view_center=view_center, view_radius=view_radius)
             if direction is not None and direction in survival_moves:
                 if not is_risky(direction):
                     return MoveAction(move=direction)
@@ -1028,6 +1112,8 @@ def _best_food_direction(
     territory_ratio: float,
     width: int,
     height: int,
+    view_center: Optional[Tuple[int, int]] = None,
+    view_radius: Optional[int] = None,
 ) -> Optional[Direction]:
     """
     Returns the best direction to reach food, or None if no food path qualifies.
@@ -1035,15 +1121,20 @@ def _best_food_direction(
     Cost formula:
         path_length
         × food_penalty(area, risk, health)
-        × (1 + 0.5 × wall_proximity_of_food)   ← discounts wall-corner food
+        × (1 + 1.0 × wall_proximity_of_food)   ← strongly discounts wall-corner food
         × lookahead_factor                        ← discounts bottleneck routes
+
+    view_center / view_radius: when set (Blackout mode), A* applies
+    BLACKOUT_BORDER_COST to cells at/beyond the vision boundary so the snake
+    avoids routing into the blind spot where invisible enemy bodies may exist.
     """
     safe_set = set(survival_moves)
     result_direction: Optional[Direction] = None
     best_cost = float('inf')
 
     for food in agent_state.possible_food:
-        direction, length = a_star_wrapper(obstacle_map, hazard_grid, head, food)
+        direction, length = a_star_wrapper(obstacle_map, hazard_grid, head, food,
+                                           view_center=view_center, view_radius=view_radius)
         if direction is None or direction not in safe_set:
             continue
 
@@ -1054,7 +1145,9 @@ def _best_food_direction(
             risky=risky, territory_ratio=territory_ratio,
         )
 
-        # Wall-proximity: food near edges is discounted (costs more to reach)
+        # Wall-proximity: food near edges is strongly discounted — multiplier
+        # increased from 0.5 → 1.0 after replay analysis showing the snake
+        # routing along the entire left wall to eat corner food at (0,14).
         food_wall_pen = wall_proximity_penalty(food.x, food.y, width, height)
 
         # Lookahead factor: routes that narrow our future options cost more
@@ -1069,7 +1162,7 @@ def _best_food_direction(
         else:
             lookahead_factor = 1.0
 
-        eff_cost = length * penalty * (1.0 + 0.5 * food_wall_pen) * lookahead_factor
+        eff_cost = length * penalty * (1.0 + 1.0 * food_wall_pen) * lookahead_factor
 
         if eff_cost < best_cost:
             result_direction = direction
@@ -1086,11 +1179,14 @@ def a_star_wrapper(
     hazard_grid: np.ndarray,
     start: Point,
     goal: Point,
+    view_center: Optional[Tuple[int, int]] = None,
+    view_radius: Optional[int] = None,
 ) -> Tuple[Optional[Direction], int]:
     if start.x == goal.x and start.y == goal.y:
         return None, 0
     h, w = grid.shape
-    path = a_star(grid, hazard_grid, (start.y, start.x), (goal.y, goal.x), w, h)
+    path = a_star(grid, hazard_grid, (start.y, start.x), (goal.y, goal.x), w, h,
+                  view_center=view_center, view_radius=view_radius)
     if path is None or len(path) < 2:
         return None, 9_999_999
     next_pos  = path[1]
@@ -1105,15 +1201,20 @@ def a_star(
     goal: Tuple[int, int],
     board_width: int,
     board_height: int,
+    view_center: Optional[Tuple[int, int]] = None,
+    view_radius: Optional[int] = None,
 ) -> Optional[List[Tuple[int, int]]]:
     """
     A* with per-cell costs:
-      • Hazard cells          → +HAZARD_A_STAR_COST   (routes around Royale zones)
-      • Wall-adjacent cells   → +wall_proximity_penalty (avoids hugging edges)
+      • Hazard cells          → +HAZARD_A_STAR_COST      (routes around Royale zones)
+      • Wall-adjacent cells   → +wall_proximity_penalty  (avoids hugging edges)
+      • Vision-boundary cells → +BLACKOUT_BORDER_COST    (Blackout mode: avoids
+                                                          routing into invisible-snake
+                                                          territory near view radius)
 
-    The wall penalty is the key fix for the replay-data deaths: food near a
-    corner is now effectively further away than the same food in open board
-    space, so the snake routes there instead of into a wall corridor.
+    The wall penalty prevents corner-food routing deaths seen in replay data.
+    The vision-boundary penalty (added after analysis of 50% invisible-body deaths)
+    biases the snake toward paths that stay inside confirmed-safe visible space.
     """
     h, w = grid.shape
     open_set: list[tuple[float, Tuple[int, int]]] = [(0.0, start)]
@@ -1140,6 +1241,13 @@ def a_star(
             if hazard_grid[nr, nc]:
                 step_cost += HAZARD_A_STAR_COST
             step_cost += wall_proximity_penalty(nc, nr, board_width, board_height)
+
+            # Blackout vision-boundary penalty: stepping toward the edge of our vision
+            # risks walking into a body segment of an invisible enemy snake.
+            if view_center is not None and view_radius is not None:
+                dist_from_head = abs(nr - view_center[0]) + abs(nc - view_center[1])
+                if dist_from_head >= view_radius:
+                    step_cost += BLACKOUT_BORDER_COST
 
             new_g = g_score[current] + step_cost
             if new_g < g_score.get(neighbor, float('inf')):
