@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: battlesnake-dominator
+    runtime: python
+    rootDir: python-app
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    plan: free
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
