@@ -105,9 +105,29 @@ def start_server(agent: BaseAgent, port):
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 
+    @app.post("/analyze/trigger")
+    def on_analyze_trigger():
+        """
+        Manually trigger one full auto-improvement cycle right now
+        (analyze -> apply -> commit to GitHub -> restart if changes were made).
+        Runs synchronously and will not return if a restart is triggered.
+        """
+        sys.path.insert(0, os.path.dirname(__file__))
+        from auto_improve import run_once
+
+        try:
+            result = run_once()
+            return jsonify(result)
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+
     host = "0.0.0.0"
 
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
+    sys.path.insert(0, os.path.dirname(__file__))
+    from auto_improve import start_scheduler
+    start_scheduler()
 
     print(f"\nRunning Battlesnake at http://{host}:{port}")
     app.run(host=host, port=port)
