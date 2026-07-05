@@ -166,5 +166,8 @@ def start_server(agent: BaseAgent, port):
     from auto_improve import start_scheduler
     start_scheduler()
 
+    from keep_alive import start_keep_alive
+    start_keep_alive()
+
     print(f"\nRunning Battlesnake at http://{host}:{port}")
     app.run(host=host, port=port)
