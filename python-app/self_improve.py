@@ -60,6 +60,14 @@ TUNING_RULES: List[Tuple] = [
     ("head_collision",  0.35,      "HUNT_HEALTH_THRESHOLD", +5.0,  20.0,  70.0),
     ("starvation",      0.25,      "URGENCY_FULL",          -5.0,  30.0,  80.0),
 ]
+# NOTE: "timeout" deaths are intentionally excluded from TUNING_RULES.
+# get_safe_moves() hard-filters out-of-bounds moves before every decision, so
+# a genuine wall-collision death can only happen when a /move response never
+# arrived and the game engine fell back to "continue last direction" until it
+# hit the edge. That is an infra/latency problem (see keep_alive.py), not
+# something any A* wall-avoidance constant can fix — bumping WALL_EDGE_COST
+# in response to a timeout spike just makes real routing more conservative
+# for no benefit.
 
 # Relaxation rules — slightly ease off when a category becomes very rare
 RELAX_RULES: List[Tuple] = [
@@ -119,6 +127,7 @@ class DeathAnalysis:
         my_health: int,
         my_length: int,
         invisible_by: bool,
+        straight_run: int = 0,
     ):
         self.game_id      = game_id
         self.total_turns  = total_turns
@@ -127,12 +136,18 @@ class DeathAnalysis:
         self.my_health    = my_health
         self.my_length    = my_length
         self.invisible_by = invisible_by  # True → "by" snake was outside vision radius
+        # Number of consecutive prior turns our head moved in the exact same
+        # direction leading up to death. get_safe_moves() hard-filters
+        # out-of-bounds moves, so a wall-collision preceded by a straight run
+        # is the signature of a /move timeout (engine kept our last direction)
+        # rather than a real routing decision. See keep_alive.py / MEMORY.md.
+        self.straight_run = straight_run
 
     def categorize(self) -> str:
+        if self.cause == "wall-collision":
+            return "timeout" if self.straight_run >= 1 else "wall_collision"
         if self.cause == "snake-self-collision" and self.invisible_by:
             return "invisible_body"
-        if self.cause == "wall-collision":
-            return "wall_collision"
         if self.cause == "head-collision":
             return "head_collision"
         if self.cause in ("snake-collision", "snake-self-collision"):
@@ -150,6 +165,7 @@ class DeathAnalysis:
             "my_health":    self.my_health,
             "my_length":    self.my_length,
             "invisible_by": self.invisible_by,
+            "straight_run": self.straight_run,
         }
 
 
@@ -272,6 +288,12 @@ class TournamentAnalyzer:
                         vis_ids = {x["id"] for x in (moves[idx].get("snakes") or [])}
                         invisible_by = by_id not in vis_ids
 
+                straight_run = 0
+                if cause == "wall-collision":
+                    straight_run = self._straight_run_before_death(
+                        moves, our_id, death_turn, death_head=s.get("head")
+                    )
+
                 return DeathAnalysis(
                     game_id      = game_id,
                     total_turns  = replay.get("total_turns", 0),
@@ -280,9 +302,56 @@ class TournamentAnalyzer:
                     my_health    = my_health,
                     my_length    = my_length,
                     invisible_by = invisible_by,
+                    straight_run = straight_run,
                 )
 
         return None  # survived
+
+    @staticmethod
+    def _straight_run_before_death(
+        moves: list, our_id: str, death_turn: int, death_head: Optional[dict]
+    ) -> int:
+        """
+        Count how many consecutive prior turns our head moved in the exact
+        same direction as the final (fatal, out-of-bounds) move. A run of
+        1+ is the timeout signature: get_safe_moves() would never choose an
+        out-of-bounds move on its own, so a wall-collision preceded by the
+        engine simply continuing our last heading means no /move response
+        arrived in time and the engine fell back to "keep going straight".
+        """
+        if not death_head:
+            return 0
+
+        def head_at(turn_idx: int) -> Optional[Tuple[int, int]]:
+            if turn_idx < 0 or turn_idx >= len(moves):
+                return None
+            us = next(
+                (x for x in (moves[turn_idx].get("snakes") or []) if x["id"] == our_id),
+                None,
+            )
+            if not us or not us.get("head"):
+                return None
+            h = us["head"]
+            return (h["x"], h["y"])
+
+        positions = [head_at(t) for t in range(max(0, death_turn - 6), death_turn)]
+        positions = [p for p in positions if p is not None]
+        positions.append((death_head["x"], death_head["y"]))
+        if len(positions) < 2:
+            return 0
+
+        directions = [
+            (positions[i + 1][0] - positions[i][0], positions[i + 1][1] - positions[i][1])
+            for i in range(len(positions) - 1)
+        ]
+        fatal_dir = directions[-1]
+        run = 0
+        for d in reversed(directions):
+            if d == fatal_dir:
+                run += 1
+            else:
+                break
+        return run - 1  # exclude the fatal move itself, count only prior repeats
 
     # ── Constants I/O ─────────────────────────────────────────────────────
 
@@ -421,6 +490,16 @@ class TournamentAnalyzer:
         current_consts = self.read_constants()
         adjustments    = self.compute_adjustments(pct, current_consts)
 
+        timeout_pct = round(pct.get("timeout", 0.0) * 100, 1)
+        infra_note = None
+        if timeout_pct >= 25:
+            infra_note = (
+                f"{timeout_pct}% of deaths look like /move timeouts (straight-line "
+                "runs into the wall, not real routing decisions) — this is an infra "
+                "latency issue (e.g. a sleeping host cold-starting), not something "
+                "agent constant tuning can fix. See keep_alive.py."
+            )
+
         report = {
             "timestamp":             datetime.now().isoformat(),
             "total_games_checked":   total_games,
@@ -436,12 +515,15 @@ class TournamentAnalyzer:
             "individual_deaths":     [a.to_dict() for a in analyses[:20]],
             "current_constants":     current_consts,
             "recommended_adjustments": adjustments,
+            "infra_note":            infra_note,
         }
 
         log.info(
             f"Analysis complete: {total_deaths} deaths in {total_games} games. "
             f"Recommendations: {len(adjustments)}"
         )
+        if infra_note:
+            log.warning(infra_note)
         return report
 
 
@@ -513,6 +595,11 @@ def _print_report(report: dict):
     print(f"\n  Current constants:")
     for name, val in (report.get("current_constants") or {}).items():
         print(f"    {name}: {val}")
+
+    infra_note = report.get("infra_note")
+    if infra_note:
+        print(f"\n  ⚠ INFRA WARNING:")
+        print(f"    {infra_note}")
 
     adjs = report.get("recommended_adjustments") or []
     if adjs:
