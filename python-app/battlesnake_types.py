@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from typing import List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class Point(BaseModel):
@@ -71,12 +71,22 @@ class MoveAction(BaseModel):
 class Snake(BaseModel):
     id: str
     name: str
-    health: int
+    # Some engine payloads report a null health for a snake that was just
+    # eliminated earlier in the same turn (elimination bookkeeping trails
+    # the board snapshot). Default to 0 ("dead") instead of rejecting the
+    # whole request, since a 500 here means we miss the /move deadline
+    # entirely and the engine falls back to "continue last direction".
+    health: Optional[int] = 0
     body: List[Optional[Point]]
     head: Optional[Point] = None
     length: Optional[int] = None
 
     model_config = {"extra": "allow"}
+
+    @field_validator("health", mode="before")
+    @classmethod
+    def _null_health_means_dead(cls, v):
+        return 0 if v is None else v
 
 
 class RulesetSettings(BaseModel):
