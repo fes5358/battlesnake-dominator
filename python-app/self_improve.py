@@ -180,16 +180,88 @@ class TournamentAnalyzer:
 
     def get_recent_game_ids(self, n: int = 30) -> List[int]:
         """Scrape /snake/{id} HTML and return the last n game IDs."""
+        return [r["game_id"] for r in self.get_recent_game_results(n)]
+
+    def get_recent_game_results(self, n: int = 30) -> List[dict]:
+        """
+        Scrape /snake/{id} HTML and return up to n recent game records.
+        Each record: {game_id, placement, timestamp, rating_change}.
+        Placement is 1-4 (int). Records are newest-first.
+        """
         url  = f"{TOURNAMENT_BASE}/snake/{SNAKE_PAGE_ID}"
         resp = self.session.get(url, timeout=15)
         resp.raise_for_status()
-        all_ids = re.findall(r'/game/(\d+)', resp.text)
-        seen, unique = set(), []
-        for gid in all_ids:
-            if gid not in seen:
-                seen.add(gid)
-                unique.append(int(gid))
-        return unique[:n]
+
+        # Parse each <tr> in the Recent Games table body
+        tbody_m = re.search(r'Recent Games.*?<tbody>(.*?)</tbody>', resp.text, re.DOTALL)
+        if not tbody_m:
+            return []
+        rows = re.findall(r'<tr>(.*?)</tr>', tbody_m.group(1), re.DOTALL)
+
+        results = []
+        place_map = {"1st": 1, "2nd": 2, "3rd": 3, "4th": 4}
+        for row in rows:
+            tds = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
+            if len(tds) < 6:
+                continue
+            def clean(s):
+                return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', s)).strip()
+
+            gid_m = re.search(r'/game/(\d+)', tds[5])
+            if not gid_m:
+                continue
+            placement_str = clean(tds[1])
+            try:
+                rating_change = float(clean(tds[2]).replace(',', '.'))
+            except ValueError:
+                rating_change = 0.0
+
+            results.append({
+                "game_id":      int(gid_m.group(1)),
+                "placement":    place_map.get(placement_str, 0),
+                "timestamp":    clean(tds[0]),
+                "rating_change": rating_change,
+            })
+            if len(results) >= n:
+                break
+        return results
+
+    def analyze_game_list(self, game_ids: List[int], label: str = "") -> dict:
+        """
+        Analyze a specific list of game IDs (already fetched/split by caller).
+        Returns the same dict shape as run_analysis but without constant-tuning.
+        """
+        analyses: List[DeathAnalysis] = []
+        survived = 0
+        for i, gid in enumerate(game_ids):
+            result = self.analyze_game(gid)
+            if result is None:
+                survived += 1
+            else:
+                analyses.append(result)
+            if (i + 1) % 5 == 0 and label:
+                log.info(f"  [{label}] Progress: {i+1}/{len(game_ids)}")
+            time.sleep(0.12)
+
+        total_games  = len(game_ids)
+        total_deaths = len(analyses)
+        cats    = Counter(a.categorize() for a in analyses)
+        total_d = max(1, total_deaths)
+        pct     = {k: v / total_d for k, v in cats.items()}
+        avg_turn   = sum(a.death_turn for a in analyses) / total_d if analyses else 0
+        avg_health = sum(a.my_health  for a in analyses) / total_d if analyses else 0
+        return {
+            "total_games":    total_games,
+            "deaths":         total_deaths,
+            "survived":       survived,
+            "win_rate":       round(survived / max(1, total_games), 3),
+            "avg_death_turn": round(avg_turn,   1),
+            "avg_health":     round(avg_health, 1),
+            "death_causes": {
+                k: {"count": cats[k], "pct": round(v * 100, 1)}
+                for k, v in sorted(pct.items(), key=lambda x: -x[1])
+            },
+        }
 
     def get_leaderboard_rating(self, snake_id: int = SNAKE_PAGE_ID) -> Optional[dict]:
         """
