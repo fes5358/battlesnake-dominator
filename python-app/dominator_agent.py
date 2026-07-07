@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from battlesnake_types import Food, GameState, MoveAction, Direction, BaseAgent, Point
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
-HUNT_HEALTH_THRESHOLD          = 40    # Hunt only when health > this
+HUNT_HEALTH_THRESHOLD          = 45    # Hunt only when health > this
 HUNT_MAX_DISTANCE              = 8     # Max A* steps to chase a hunt target
 SQUEEZE_HEALTH_THRESHOLD       = 40    # Squeeze only when health > this
 SQUEEZE_FOOD_INTERRUPT_HEALTH  = 55    # Within squeeze, eat first when health ≤ this
@@ -46,7 +46,7 @@ TERRITORY_DECLINING_THRESHOLD  = -0.04 # per-turn ratio drop → treat as extra 
 # Enemy bodies can be at cells that appear empty on our obstacle map.  By adding a
 # large A* cost to cells at or beyond the vision boundary we bias the snake toward
 # paths that stay inside confirmed-safe territory and away from the blind spot.
-BLACKOUT_BORDER_COST           = 4.5  # A* penalty per cell at/beyond vision radius
+BLACKOUT_BORDER_COST           = 4.0  # A* penalty per cell at/beyond vision radius
 
 # Ghost snake memory (Blackout mode)
 # When an opponent disappears beyond our vision circle we keep their last-known
@@ -107,17 +107,37 @@ def get_obstacle_map(game_state: GameState, include_hazards: bool = False) -> np
     Build the occupancy grid.  All snake body segments except the tail are
     marked True.  When include_hazards=True the visible hazard cells are also
     marked, so A* and flood-fill treat them as hard walls.
+
+    Special case: if a snake's head is adjacent to food, they will eat this
+    turn and their tail will NOT slide away.  We mark that tail cell as blocked
+    to avoid routing through it (early-game body-collision fix).
     """
     h = game_state.board.height
     w = game_state.board.width
     obstacle_map = np.zeros((h, w), dtype=bool)
 
+    food_set = {(f.x, f.y) for f in game_state.board.food}
+
     for snake in game_state.board.snakes:
-        for body_part in snake.body[:-1]:
+        body = snake.body
+        for body_part in body[:-1]:
             if body_part is None:
                 continue
             if 0 <= body_part.y < h and 0 <= body_part.x < w:
                 obstacle_map[body_part.y, body_part.x] = True
+
+        # If this snake is adjacent to food it will eat this turn, meaning
+        # its tail stays put.  Block the tail cell to prevent routing through it.
+        if snake.head is not None and body:
+            hx, hy = snake.head.x, snake.head.y
+            will_eat = any(
+                (hx + dx, hy + dy) in food_set
+                for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0))
+            )
+            if will_eat:
+                tail = body[-1]
+                if tail is not None and 0 <= tail.y < h and 0 <= tail.x < w:
+                    obstacle_map[tail.y, tail.x] = True
 
     if include_hazards:
         for hz in game_state.board.hazards:
@@ -640,7 +660,10 @@ def find_hunt_move(
     for snake in game_state.board.snakes:
         if snake.id == my_id or snake.head is None:
             continue
-        if (snake.length or len(snake.body)) >= snake_length:
+        opp_len = snake.length or len(snake.body)
+        # Require ≥ 2 length advantage. Chasing a snake only 1 shorter means
+        # equal-size opponents nearby can ambush us while we pursue.
+        if opp_len >= snake_length - 1:
             continue
 
         for d in Direction:
@@ -908,6 +931,17 @@ class DominatorAgent(BaseAgent):
 
         def is_risky(d: Direction) -> bool:
             return (head.x + d.dx, head.y + d.dy) in risk_cells
+
+        # ── 5c. Hard-filter risk cells from survival moves ────────────────────
+        #
+        # risk_cells covers every cell reachable next turn by an equal-or-larger
+        # opponent head.  Stepping there is a potential lethal head-on.  When at
+        # least one non-risky survival move exists, drop risky moves entirely so
+        # all downstream modes (hunt, cutoff, squeeze, coil, food, rank_key)
+        # draw only from safe candidates — not just soft-prefer them.
+        non_risky_survival = [d for d in survival_moves if not is_risky(d)]
+        if non_risky_survival:
+            survival_moves = non_risky_survival
 
         # ── 6. Minimax 2-step lookahead ───────────────────────────────────────
         lookahead_scores = compute_lookahead_scores(
